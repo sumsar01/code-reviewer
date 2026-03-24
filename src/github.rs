@@ -65,23 +65,58 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Build a client using the token from `gh auth token`.
-    pub async fn new() -> Result<Self> {
+    /// Build a client, picking the gh account that can access `repo_owner`.
+    /// Falls back to the active account if no better match is found.
+    pub async fn new_for_owner(repo_owner: &str) -> Result<Self> {
+        let accounts = list_gh_accounts()?;
+
+        for account in &accounts {
+            let token = get_gh_token_for(account)?;
+            let octo = Octocrab::builder()
+                .personal_token(token.clone())
+                .build()
+                .context("Building octocrab client")?;
+
+            let user = octo.current().user().await;
+            let username = match user {
+                Ok(u) => u.login,
+                Err(_) => continue,
+            };
+
+            // Exact match: user owns the repo directly
+            if username.eq_ignore_ascii_case(repo_owner) {
+                return Ok(Self { octo, username });
+            }
+
+            // Org match: check if repo_owner is an org this account belongs to
+            let is_member = octo
+                .orgs(repo_owner)
+                .check_membership(&username)
+                .await
+                .is_ok();
+
+            if is_member {
+                return Ok(Self { octo, username });
+            }
+        }
+
+        // Fall back to active account
         let token = get_gh_token()?;
         let octo = Octocrab::builder()
             .personal_token(token)
             .build()
             .context("Building octocrab client")?;
-
-        // Get the authenticated user's login
         let user = octo
             .current()
             .user()
             .await
             .context("Fetching authenticated user")?;
-        let username = user.login;
+        Ok(Self { octo, username: user.login })
+    }
 
-        Ok(Self { octo, username })
+    /// Build a client using the active gh account (no owner hint).
+    pub async fn new() -> Result<Self> {
+        Self::new_for_owner("").await
     }
 
     /// List open PRs for the given repo.
@@ -197,10 +232,19 @@ impl GitHubClient {
     }
 }
 
-/// Get the GitHub OAuth token by shelling out to `gh auth token`.
+/// Get the GitHub OAuth token for the active gh account.
 fn get_gh_token() -> Result<String> {
+    gh_token_cmd(&["auth", "token"])
+}
+
+/// Get the GitHub OAuth token for a specific gh account username.
+fn get_gh_token_for(user: &str) -> Result<String> {
+    gh_token_cmd(&["auth", "token", "-u", user])
+}
+
+fn gh_token_cmd(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
-        .args(["auth", "token"])
+        .args(args)
         .output()
         .context("Running `gh auth token` — is the gh CLI installed?")?;
 
@@ -221,6 +265,28 @@ fn get_gh_token() -> Result<String> {
     }
 
     Ok(token)
+}
+
+/// Return all account logins from `gh auth status`.
+fn list_gh_accounts() -> Result<Vec<String>> {
+    let output = Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .context("Running `gh auth status`")?;
+
+    // gh auth status writes to stderr
+    let text = String::from_utf8_lossy(&output.stderr);
+    let mut accounts = Vec::new();
+    for line in text.lines() {
+        // Lines look like:  "  ✓ Logged in to github.com account USERNAME (keyring)"
+        if let Some(rest) = line.trim().strip_prefix("✓ Logged in to github.com account ") {
+            let username = rest.split_whitespace().next().unwrap_or("").to_string();
+            if !username.is_empty() {
+                accounts.push(username);
+            }
+        }
+    }
+    Ok(accounts)
 }
 
 // ── Diff parsing ─────────────────────────────────────────────────────────────

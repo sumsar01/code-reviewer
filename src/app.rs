@@ -76,12 +76,10 @@ pub struct App {
 impl App {
     pub async fn new() -> Result<Self> {
         let config = config::load()?;
-        let github = Arc::new(GitHubClient::new().await?);
 
-        // Detect CWD repo
+        // Detect CWD repo first so we can pick the right gh account
         let repo = git::detect_repo(&std::env::current_dir()?)
             .ok()
-            // fall back to config's last repo
             .or_else(|| {
                 config.ui.last_repo.as_ref().and_then(|s| {
                     let mut parts = s.splitn(2, '/');
@@ -91,6 +89,9 @@ impl App {
                     })
                 })
             });
+
+        let owner_hint = repo.as_ref().map(|r| r.owner.as_str()).unwrap_or("");
+        let github = Arc::new(GitHubClient::new_for_owner(owner_hint).await?);
 
         let (tx, rx) = mpsc::unbounded_channel();
 
