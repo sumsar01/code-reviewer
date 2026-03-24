@@ -1,13 +1,13 @@
+use crate::ui::theme::Theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 const HELP_TEXT: &[(&str, &str)] = &[
-    // key, description
     ("PR List", ""),
     ("j / k", "Navigate up/down"),
     ("Enter", "Open PR detail"),
@@ -17,7 +17,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("q", "Quit"),
     ("", ""),
     ("PR Detail", ""),
-    ("Tab", "Switch Diff ↔ Comments"),
+    ("Tab", "Switch Diff ↔ Comments ↔ Difftastic"),
     ("j / k", "Scroll"),
     ("n / N", "Next / previous changed file"),
     ("c", "Checkout PR branch"),
@@ -28,30 +28,29 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("?", "Toggle this help"),
 ];
 
-pub fn render(f: &mut Frame) {
+pub fn render(f: &mut Frame, t: &Theme) {
     let area = centered_rect(60, 70, f.area());
 
-    // Clear the area underneath the popup
     f.render_widget(Clear, area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (key, desc) in HELP_TEXT {
         if desc.is_empty() {
-            // Section header or blank line
             if key.is_empty() {
                 lines.push(Line::from(""));
             } else {
+                // Section header
                 lines.push(Line::from(Span::styled(
-                    format!("── {} ", key),
+                    format!("  {key}"),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(t.section_header)
                         .add_modifier(Modifier::BOLD),
                 )));
             }
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", key), Style::default().fg(Color::Yellow)),
-                Span::raw(desc.to_string()),
+                Span::styled(format!("  {} ", key), t.key_badge_style()),
+                Span::styled(format!("  {desc}"), t.key_desc_style()),
             ]));
         }
     }
@@ -60,8 +59,13 @@ pub fn render(f: &mut Frame) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Help — press ? to close "),
+                .border_style(t.border_style())
+                .title(Span::styled(
+                    " Help — press ? to close ",
+                    Style::default()
+                        .fg(t.text_accent)
+                        .add_modifier(Modifier::BOLD),
+                )),
         )
         .alignment(Alignment::Left);
 

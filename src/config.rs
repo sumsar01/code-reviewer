@@ -14,6 +14,13 @@ pub struct UiConfig {
     pub last_repo: Option<String>,
     /// If true, show all PRs; if false, show only the authenticated user's PRs.
     pub show_all_prs: bool,
+    /// Name of the color theme to use. Defaults to "tokyonight".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "tokyonight".to_string()
 }
 
 impl Default for UiConfig {
@@ -21,6 +28,7 @@ impl Default for UiConfig {
         Self {
             last_repo: None,
             show_all_prs: false,
+            theme: default_theme(),
         }
     }
 }

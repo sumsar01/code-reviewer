@@ -11,6 +11,8 @@ pub struct PullRequest {
     pub author: String,
     pub head_branch: String,
     pub base_branch: String,
+    pub head_sha: String,
+    pub base_sha: String,
     pub state: String,
     pub draft: bool,
     pub url: String,
@@ -114,11 +116,6 @@ impl GitHubClient {
         Ok(Self { octo, username: user.login })
     }
 
-    /// Build a client using the active gh account (no owner hint).
-    pub async fn new() -> Result<Self> {
-        Self::new_for_owner("").await
-    }
-
     /// List open PRs for the given repo.
     /// If `mine_only` is true, filters to PRs authored by the authenticated user.
     pub async fn list_prs(
@@ -163,6 +160,8 @@ impl GitHubClient {
                         .ref_field
                         .clone(),
                     base_branch: pr.base.ref_field.clone(),
+                    head_sha: pr.head.sha.clone(),
+                    base_sha: pr.base.sha.clone(),
                     state: pr
                         .state
                         .as_ref()
@@ -231,8 +230,6 @@ impl GitHubClient {
         Ok(result)
     }
 }
-
-/// Get the GitHub OAuth token for the active gh account.
 fn get_gh_token() -> Result<String> {
     gh_token_cmd(&["auth", "token"])
 }

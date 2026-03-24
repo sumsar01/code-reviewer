@@ -1,11 +1,15 @@
 use anyhow::{bail, Context, Result};
 use git2::Repository;
+use std::path::PathBuf;
 
 /// Detected GitHub repository coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoInfo {
     pub owner: String,
     pub name: String,
+    /// The local working directory of the repo, if we detected it from a local
+    /// `git2::Repository`. `None` when reconstructed from saved config.
+    pub workdir: Option<PathBuf>,
 }
 
 impl RepoInfo {
@@ -18,12 +22,14 @@ impl RepoInfo {
 /// the first remote whose URL contains "github.com".
 pub fn detect_repo(path: &std::path::Path) -> Result<RepoInfo> {
     let repo = Repository::discover(path).context("Not inside a git repository")?;
+    let workdir = repo.workdir().map(|p| p.to_path_buf());
 
     let remotes = repo.remotes()?;
     for name in remotes.iter().flatten() {
         let remote = repo.find_remote(name)?;
         if let Some(url) = remote.url() {
-            if let Some(info) = parse_github_url(url) {
+            if let Some(mut info) = parse_github_url(url) {
+                info.workdir = workdir;
                 return Ok(info);
             }
         }
@@ -61,7 +67,11 @@ fn split_owner_repo(s: &str) -> Option<RepoInfo> {
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some(RepoInfo { owner, name })
+    Some(RepoInfo {
+        owner,
+        name,
+        workdir: None,
+    })
 }
 
 #[cfg(test)]

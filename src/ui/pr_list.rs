@@ -1,31 +1,44 @@
 use crate::app::{App, LoadState};
+use crate::ui::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
 
-pub fn render(f: &mut Frame, app: &mut App) {
+/// Truncate a string to `max_chars`, appending `…` if truncated.
+fn truncate(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        chars[..max_chars.saturating_sub(1)]
+            .iter()
+            .collect::<String>()
+            + "…"
+    }
+}
+
+pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let area = f.area();
 
-    // Split: title bar | list | status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
+            Constraint::Length(2), // header
             Constraint::Min(0),    // list
-            Constraint::Length(1), // status
+            Constraint::Length(1), // status bar
         ])
         .split(area);
 
-    render_header(f, app, chunks[0]);
-    render_list(f, app, chunks[1]);
-    render_statusbar(f, app, chunks[2]);
+    render_header(f, app, chunks[0], t);
+    render_list(f, app, chunks[1], t);
+    render_statusbar(f, chunks[2], t);
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
+fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let repo = app
         .repo
         .as_ref()
@@ -38,27 +51,41 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         "my PRs"
     };
 
-    let title = format!(" prr  {repo}  [{filter}] ");
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(block, area);
+    let line = Line::from(vec![
+        Span::styled(
+            " prr ",
+            Style::default()
+                .fg(t.text_accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(repo, Style::default().fg(t.text_dim)),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("[{filter}]"),
+            Style::default()
+                .fg(t.pr_number)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let p = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
+    f.render_widget(p, area);
 }
 
-fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     match &app.pr_load_state {
         LoadState::Loading => {
-            let p = Paragraph::new("Loading pull requests…")
-                .style(Style::default().fg(Color::Yellow))
-                .block(Block::default().borders(Borders::ALL));
+            let p = Paragraph::new("  Loading pull requests…")
+                .style(t.text_dim_style())
+                .block(Block::default().borders(Borders::NONE));
             f.render_widget(p, area);
             return;
         }
         LoadState::Error(e) => {
-            let p = Paragraph::new(format!("Error: {e}"))
-                .style(Style::default().fg(Color::Red))
-                .block(Block::default().borders(Borders::ALL));
+            let p = Paragraph::new(format!("  Error: {e}"))
+                .style(Style::default().fg(t.diff_removed_fg))
+                .block(Block::default().borders(Borders::NONE));
             f.render_widget(p, area);
             return;
         }
@@ -67,11 +94,13 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     if app.prs.is_empty() {
         let msg = if app.config.ui.show_all_prs {
-            "No open PRs for this repository."
+            "  No open PRs for this repository."
         } else {
-            "No open PRs from you. Press 'a' to show all."
+            "  No open PRs from you. Press 'a' to show all."
         };
-        let p = Paragraph::new(msg).block(Block::default().borders(Borders::ALL));
+        let p = Paragraph::new(msg)
+            .style(t.text_dim_style())
+            .block(Block::default().borders(Borders::NONE));
         f.render_widget(p, area);
         return;
     }
@@ -82,42 +111,83 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, pr)| {
             let selected = i == app.pr_cursor;
-            let draft_tag = if pr.draft { " [draft]" } else { "" };
-            let number = format!("#{:<5}", pr.number);
-            let author = format!("{:<20}", pr.author);
-            let additions = pr.additions.map(|v| format!("+{v}")).unwrap_or_default();
-            let deletions = pr.deletions.map(|v| format!("-{v}")).unwrap_or_default();
-            let stats = format!("{:>6} {:>6}", additions, deletions);
-
-            let style = if selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+            let base_style = if selected {
+                t.selection_style()
             } else {
                 Style::default()
             };
 
-            let line = Line::from(vec![
-                Span::styled(number, style.fg(Color::Yellow)),
-                Span::raw(" "),
-                Span::styled(format!("{}{}", pr.title, draft_tag), style),
-                Span::raw("  "),
-                Span::styled(author, style.fg(Color::Blue)),
-                Span::styled(format!("  {}", stats), style.fg(Color::DarkGray)),
-            ]);
+            let number = format!(" #{:<5}", pr.number);
+            let author = format!("{:<20}", pr.author);
+            let additions = pr.additions.map(|v| format!("+{v}")).unwrap_or_default();
+            let deletions = pr.deletions.map(|v| format!("-{v}")).unwrap_or_default();
+            let total = match (pr.additions, pr.deletions) {
+                (Some(a), Some(d)) => format!("±{}", a + d),
+                _ => String::new(),
+            };
+            let stats = format!("{:>6} {:>6} {:>7}", additions, deletions, total);
 
-            ListItem::new(line)
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let fixed = 7 + 1 + 2 + 20 + 2 + stats.len() + if pr.draft { 8 } else { 0 };
+            let title_width = inner_width.saturating_sub(fixed);
+            let title_display = truncate(&pr.title, title_width);
+
+            let mut spans = vec![
+                Span::styled(
+                    number,
+                    base_style.fg(t.pr_number).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ", base_style),
+                Span::styled(
+                    format!("{:<width$}", title_display, width = title_width),
+                    base_style.fg(t.text),
+                ),
+            ];
+
+            if pr.draft {
+                spans.push(Span::styled(
+                    " ▸DRAFT",
+                    base_style.fg(t.pr_draft).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            spans.push(Span::styled("  ", base_style));
+            spans.push(Span::styled(author, base_style.fg(t.pr_author)));
+            spans.push(Span::styled("  ", base_style));
+            spans.push(Span::styled(stats, base_style.fg(t.text_dim)));
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(t.border_dim_style()),
+    );
     f.render_widget(list, area);
 }
 
-fn render_statusbar(f: &mut Frame, _app: &App, area: Rect) {
-    let help = Paragraph::new(
-        " j/k navigate  Enter open  a toggle mine/all  r refresh  o browser  ? help  q quit",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(help, area);
+fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
+    let hints: &[(&str, &str)] = &[
+        ("j/k", "navigate"),
+        ("Enter", "open"),
+        ("a", "toggle mine/all"),
+        ("r", "refresh"),
+        ("o", "browser"),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", t.text_dim_style()));
+        }
+        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
+        spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
+    }
+
+    let p = Paragraph::new(Line::from(spans));
+    f.render_widget(p, area);
 }

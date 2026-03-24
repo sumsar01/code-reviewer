@@ -1,14 +1,14 @@
 use crate::app::{App, DetailTab};
-use crate::ui::{comments, diff};
+use crate::ui::{comments, diff, difftastic, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
     Frame,
 };
 
-pub fn render(f: &mut Frame, app: &mut App) {
+pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let pr = match app.prs.get(app.pr_cursor) {
         Some(pr) => pr.clone(),
         None => return,
@@ -19,87 +19,136 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // PR header
-            Constraint::Length(3), // tabs
+            Constraint::Length(2), // tabs (slim)
             Constraint::Min(0),    // content
             Constraint::Length(1), // status bar
         ])
         .split(area);
 
-    render_pr_header(f, &pr, chunks[0]);
-    render_tabs(f, app, chunks[1]);
+    render_pr_header(f, &pr, chunks[0], t);
+    render_tabs(f, app, chunks[1], t);
 
     match app.detail_tab {
-        DetailTab::Diff => diff::render(f, app, chunks[2]),
-        DetailTab::Comments => comments::render(f, app, chunks[2]),
+        DetailTab::Diff => diff::render(f, app, chunks[2], t),
+        DetailTab::Comments => comments::render(f, app, chunks[2], t),
+        DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t),
     }
 
-    render_statusbar(f, app, chunks[3]);
+    render_statusbar(f, chunks[3], t);
 }
 
-fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect) {
-    let draft = if pr.draft { " [DRAFT]" } else { "" };
-    let stats = match (pr.additions, pr.deletions, pr.changed_files) {
-        (Some(a), Some(d), Some(c)) => format!("+{a} -{d}  {c} files changed"),
-        _ => String::new(),
-    };
+fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, t: &Theme) {
+    let draft = if pr.draft { "  ▸DRAFT" } else { "" };
 
     let lines = vec![
+        // Title line
         Line::from(vec![
             Span::styled(
                 format!("#{} ", pr.number),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(t.pr_number)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{}{}", pr.title, draft),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
             ),
         ]),
+        // Author + branch line
         Line::from(vec![
-            Span::styled("author: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(pr.author.clone(), Style::default().fg(Color::Blue)),
-            Span::raw("  "),
+            Span::styled("by ", Style::default().fg(t.text_dim)),
             Span::styled(
-                format!("{} → {}", pr.head_branch, pr.base_branch),
-                Style::default().fg(Color::DarkGray),
+                pr.author.clone(),
+                Style::default()
+                    .fg(t.pr_author)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::styled("   ", Style::default()),
+            Span::styled(pr.head_branch.clone(), Style::default().fg(t.text_accent)),
+            Span::styled(" → ", Style::default().fg(t.text_dim)),
+            Span::styled(pr.base_branch.clone(), Style::default().fg(t.text_dim)),
         ]),
-        Line::from(Span::styled(stats, Style::default().fg(Color::Green))),
+        // Stats line
+        Line::from(match (pr.additions, pr.deletions, pr.changed_files) {
+            (Some(a), Some(d), Some(c)) => vec![
+                Span::styled(format!("+{a}"), Style::default().fg(t.stats_added)),
+                Span::styled("  ", Style::default()),
+                Span::styled(format!("-{d}"), Style::default().fg(t.stats_removed)),
+                Span::styled(
+                    format!("  {c} files changed"),
+                    Style::default().fg(t.text_dim),
+                ),
+            ],
+            _ => vec![],
+        }),
     ];
 
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Pull Request "),
+            .border_style(t.border_style())
+            .title(Span::styled(
+                " Pull Request ",
+                Style::default().fg(t.text_dim),
+            )),
     );
     f.render_widget(p, area);
 }
 
-fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = vec![Line::from("Diff"), Line::from("Comments")];
+fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    let tab_names = ["  Diff  ", "  Comments  ", "  Difftastic  "];
 
     let selected = match app.detail_tab {
         DetailTab::Diff => 0,
         DetailTab::Comments => 1,
+        DetailTab::Difftastic => 2,
     };
+
+    let titles: Vec<Line> = tab_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if i == selected {
+                Line::from(Span::styled(*name, t.tab_active_style()))
+            } else {
+                Line::from(Span::styled(*name, t.tab_inactive_style()))
+            }
+        })
+        .collect();
 
     let tabs = Tabs::new(titles)
         .select(selected)
-        .block(Block::default().borders(Borders::ALL))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(t.border_dim_style()),
+        )
+        .highlight_style(t.tab_active_style())
+        .divider(Span::styled(" │ ", t.border_dim_style()));
 
     f.render_widget(tabs, area);
 }
 
-fn render_statusbar(f: &mut Frame, _app: &App, area: Rect) {
-    let p = Paragraph::new(
-        " Tab switch pane  j/k scroll  n/N next/prev file  c checkout  o browser  Esc back  ? help",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
+    let hints: &[(&str, &str)] = &[
+        ("Tab", "switch pane"),
+        ("j/k", "scroll"),
+        ("n/N", "next/prev file"),
+        ("c", "checkout"),
+        ("o", "browser"),
+        ("Esc", "back"),
+        ("?", "help"),
+    ];
+
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", t.text_dim_style()));
+        }
+        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
+        spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
+    }
+
+    let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
