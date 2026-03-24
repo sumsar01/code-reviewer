@@ -136,6 +136,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("n/N", "next/prev file"),
         ("c", "checkout"),
         ("o", "browser"),
+        ("T", "theme"),
         ("Esc", "back"),
         ("?", "help"),
     ];

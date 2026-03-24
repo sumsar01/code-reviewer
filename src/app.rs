@@ -55,6 +55,9 @@ pub struct App {
     pub screen: Screen,
     pub detail_tab: DetailTab,
     pub show_help: bool,
+    pub show_theme_picker: bool,
+    pub theme_picker_cursor: usize,
+    pub theme_picker_original: Option<Theme>,
     pub config: Config,
     pub theme: Theme,
 
@@ -112,6 +115,9 @@ impl App {
             screen: Screen::PrList,
             detail_tab: DetailTab::Diff,
             show_help: false,
+            show_theme_picker: false,
+            theme_picker_cursor: Theme::index_of(&config.ui.theme),
+            theme_picker_original: None,
             theme,
             config,
             repo,
@@ -172,6 +178,11 @@ impl App {
 
     /// Returns `true` if the app should quit.
     fn handle_key(&mut self, code: KeyCode) -> bool {
+        // Theme picker intercepts everything when open.
+        if self.show_theme_picker {
+            return self.handle_key_theme_picker(code);
+        }
+
         // Help overlay intercepts everything except ?
         if self.show_help {
             self.show_help = false;
@@ -182,6 +193,36 @@ impl App {
             Screen::PrList => self.handle_key_list(code),
             Screen::PrDetail => self.handle_key_detail(code),
         }
+    }
+
+    fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.theme_picker_cursor + 1 < ALL_THEMES.len() {
+                    self.theme_picker_cursor += 1;
+                    self.theme = Theme::from_name(ALL_THEMES[self.theme_picker_cursor].0);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.theme_picker_cursor > 0 {
+                    self.theme_picker_cursor -= 1;
+                    self.theme = Theme::from_name(ALL_THEMES[self.theme_picker_cursor].0);
+                }
+            }
+            KeyCode::Enter => {
+                self.config.ui.theme = ALL_THEMES[self.theme_picker_cursor].0.to_string();
+                self.theme_picker_original = None;
+                self.show_theme_picker = false;
+            }
+            KeyCode::Esc => {
+                if let Some(original) = self.theme_picker_original.take() {
+                    self.theme = original;
+                }
+                self.show_theme_picker = false;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn handle_key_list(&mut self, code: KeyCode) -> bool {
@@ -216,6 +257,11 @@ impl App {
                 if let Some(pr) = self.prs.get(self.pr_cursor) {
                     let _ = open::that(&pr.url);
                 }
+            }
+            KeyCode::Char('T') => {
+                self.theme_picker_original = Some(self.theme.clone());
+                self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
+                self.show_theme_picker = true;
             }
             _ => {}
         }
@@ -294,6 +340,11 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.checkout_pr_branch();
+            }
+            KeyCode::Char('T') => {
+                self.theme_picker_original = Some(self.theme.clone());
+                self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
+                self.show_theme_picker = true;
             }
             _ => {}
         }
@@ -416,10 +467,9 @@ impl App {
             let output = std::process::Command::new("git")
                 .args([
                     "-c",
-                    "diff.external=difft",
+                    "diff.external=difft --color=always",
                     "diff",
                     "--ext-diff",
-                    "--color=always",
                     &format!("{}..{}", base_sha, head_sha),
                 ])
                 .current_dir(&workdir)
@@ -518,86 +568,108 @@ impl App {
 
 // ── Difftastic output parser ──────────────────────────────────────────────────
 
-/// Split the combined `git diff --ext-diff` output (where each file's difft
-/// output is concatenated) into per-file sections.
+/// Split the combined `git diff --ext-diff` output into per-file sections.
 ///
-/// Difftastic starts each file with a header line of the form:
-///   `<ANSI codes><filename><ANSI reset> --- <Language>`
+/// Difftastic emits one header line **per hunk**, not per file:
+///   - Single-hunk file:  `filename --- Language`
+///   - Multi-hunk file:   `filename --- 1/3 --- Language`
+///                        `filename --- 2/3 --- Language`
+///                        ...
 ///
-/// We detect these headers by stripping ANSI escape sequences and matching
-/// the ` --- ` separator that cannot appear in normal diff content lines
-/// (line numbers, code, etc.).
+/// We detect hunk headers, group all hunks for the same filename into one
+/// entry, and include every hunk header line so the TUI shows them in context.
 fn split_difft_output(stdout: &str) -> Vec<(String, Vec<Line<'static>>)> {
-    let mut results: Vec<(String, Vec<Line<'static>>)> = Vec::new();
-
-    // Each "section" is (filename, raw lines of that section including header).
-    let mut current_name: Option<String> = None;
-    let mut current_lines: Vec<&str> = Vec::new();
+    // Collect (filename, hunk_index, raw_line_slice) tuples first.
+    // hunk_index = 1 for "first hunk of a file" (or 0 when no counter).
+    let mut sections: Vec<(String, usize, Vec<&str>)> = Vec::new();
+    let mut cur_lines: Vec<&str> = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_hunk: usize = 0;
 
     for line in stdout.lines() {
         let stripped = strip_ansi(line);
-        // A file header looks like "src/foo.rs --- Rust" or ".gitignore --- Text"
-        // It must not start with a digit (line numbers) and must contain " --- ".
-        if let Some(filename) = detect_file_header(&stripped) {
-            // Flush previous section
-            if let Some(name) = current_name.take() {
-                let parsed = crate::ui::difftastic::parse_ansi_to_lines(
-                    &current_lines.join("\n"),
-                );
-                results.push((name, parsed));
-                current_lines.clear();
+        if let Some((filename, hunk_idx)) = detect_hunk_header(&stripped) {
+            if !cur_name.is_empty() {
+                sections.push((cur_name.clone(), cur_hunk, cur_lines.clone()));
+                cur_lines.clear();
             }
-            current_name = Some(filename);
-            current_lines.push(line);
+            cur_name = filename;
+            cur_hunk = hunk_idx;
+            cur_lines.push(line);
         } else {
-            current_lines.push(line);
+            cur_lines.push(line);
         }
     }
+    if !cur_name.is_empty() {
+        sections.push((cur_name, cur_hunk, cur_lines));
+    }
 
-    // Flush last section
-    if let Some(name) = current_name.take() {
-        let parsed = crate::ui::difftastic::parse_ansi_to_lines(
-            &current_lines.join("\n"),
-        );
-        results.push((name, parsed));
+    // Merge hunks that belong to the same file into a single entry.
+    // A new file starts when hunk_index == 1 (or 0 for single-hunk files).
+    let mut results: Vec<(String, Vec<Line<'static>>)> = Vec::new();
+
+    for (filename, hunk_idx, raw_lines) in sections {
+        let is_new_file = hunk_idx <= 1;
+
+        if is_new_file {
+            // Start a fresh entry.
+            let parsed = crate::ui::difftastic::parse_ansi_to_lines(&raw_lines.join("\n"));
+            results.push((filename, parsed));
+        } else {
+            // Append to the last entry (same file, subsequent hunk).
+            if let Some(last) = results.last_mut() {
+                let extra = crate::ui::difftastic::parse_ansi_to_lines(&raw_lines.join("\n"));
+                last.1.extend(extra);
+            }
+        }
     }
 
     results
 }
 
-/// Detect whether a (ANSI-stripped) line is a difftastic file header.
-/// Returns the filename if it is, or `None` otherwise.
+/// Detect a difftastic hunk header line (ANSI already stripped).
 ///
-/// Header format: `<path> --- <Language>`
-/// Rules to avoid false positives:
-///   - Must contain " --- "
-///   - The part before " --- " must not be empty
-///   - Must not start with a digit (would be a line-number column)
-fn detect_file_header(stripped: &str) -> Option<String> {
+/// Formats:
+///   `filename --- Language`            → returns (filename, 0)  [single hunk]
+///   `filename --- N/M --- Language`    → returns (filename, N)  [hunk N of M]
+///
+/// Guards against false positives from diff content lines (which start with
+/// digits for line-number columns).
+fn detect_hunk_header(stripped: &str) -> Option<(String, usize)> {
     let sep = " --- ";
-    let pos = stripped.find(sep)?;
-    let before = &stripped[..pos];
-    let after = &stripped[pos + sep.len()..];
 
-    // Must have a non-empty path and a non-empty language
-    if before.is_empty() || after.is_empty() {
+    // The filename is everything before the first " --- ".
+    let first_sep = stripped.find(sep)?;
+    let filename = stripped[..first_sep].trim();
+
+    // Filename must be non-empty and must not start with a digit or space.
+    // (Diff content lines always start with spaces+digits for line-number columns.)
+    if filename.is_empty() || filename.starts_with(|c: char| c.is_ascii_digit() || c == ' ') {
         return None;
     }
 
-    // Must not start with a digit (line-number columns from difft output)
-    if before.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
+    let after = &stripped[first_sep + sep.len()..];
 
-    // Language label should be a single word or short identifier (no spaces
-    // containing digit-only strings = avoids matching diff content).
-    // Just check that the language part doesn't start with a digit.
-    let lang_word = after.split_whitespace().next().unwrap_or("");
-    if lang_word.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
+    // Check if after is "N/M --- Language" (multi-hunk) or just "Language".
+    // We look for a second " --- " in `after`.
+    if let Some(second_sep) = after.find(sep) {
+        // Multi-hunk: after[..second_sep] should be "N/M"
+        let hunk_part = &after[..second_sep];
+        if let Some(slash) = hunk_part.find('/') {
+            let n: usize = hunk_part[..slash].trim().parse().ok()?;
+            return Some((filename.to_string(), n));
+        }
+        // Unexpected format — treat as new file.
+        Some((filename.to_string(), 1))
+    } else {
+        // Single-hunk file: after is just "Language" (or "Language (note)").
+        // Language must not be empty and must not start with a digit.
+        let lang = after.trim();
+        if lang.is_empty() || lang.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((filename.to_string(), 0))
     }
-
-    Some(before.to_string())
 }
 
 /// Strip ANSI escape sequences from a string for pattern matching.
@@ -614,8 +686,6 @@ fn strip_ansi(s: &str) -> String {
             }
             i += 1; // skip the terminating letter
         } else {
-            // Safe: we only advance by one byte when it's ASCII; for multi-byte
-            // UTF-8 sequences we need to push the whole char.
             let ch_len = utf8_char_len(bytes[i]);
             if i + ch_len <= len {
                 out.push_str(&s[i..i + ch_len]);
@@ -633,4 +703,104 @@ fn utf8_char_len(b: u8) -> usize {
     else if b < 0xE0 { 2 }
     else if b < 0xF0 { 3 }
     else { 4 }
+}
+
+#[cfg(test)]
+mod difft_parser_tests {
+    use super::{detect_hunk_header, split_difft_output};
+
+    // ── detect_hunk_header ────────────────────────────────────────────────────
+
+    #[test]
+    fn single_hunk_rust() {
+        let h = detect_hunk_header("src/config.rs --- Rust").unwrap();
+        assert_eq!(h.0, "src/config.rs");
+        assert_eq!(h.1, 0);
+    }
+
+    #[test]
+    fn single_hunk_text() {
+        let h = detect_hunk_header(".gitignore --- Text").unwrap();
+        assert_eq!(h.0, ".gitignore");
+        assert_eq!(h.1, 0);
+    }
+
+    #[test]
+    fn multi_hunk_first() {
+        let h = detect_hunk_header("src/git.rs --- 1/3 --- Rust").unwrap();
+        assert_eq!(h.0, "src/git.rs");
+        assert_eq!(h.1, 1);
+    }
+
+    #[test]
+    fn multi_hunk_middle() {
+        let h = detect_hunk_header("src/git.rs --- 2/3 --- Rust").unwrap();
+        assert_eq!(h.0, "src/git.rs");
+        assert_eq!(h.1, 2);
+    }
+
+    #[test]
+    fn exceeded_graph_limit() {
+        // difft falls back to Text with a note
+        let h = detect_hunk_header("src/app.rs --- 1/13 --- Text (exceeded DFT_GRAPH_LIMIT)").unwrap();
+        assert_eq!(h.0, "src/app.rs");
+        assert_eq!(h.1, 1);
+    }
+
+    #[test]
+    fn content_line_space_prefix_rejected() {
+        // Typical diff content line with left+right line numbers
+        assert!(detect_hunk_header(" 1  1 use anyhow;").is_none());
+        assert!(detect_hunk_header("  2  2 use git2::Repository;").is_none());
+    }
+
+    #[test]
+    fn content_line_digit_prefix_rejected() {
+        assert!(detect_hunk_header("1 2 some code --- more code").is_none());
+    }
+
+    #[test]
+    fn ellipsis_context_line_rejected() {
+        // difft emits "..." between non-adjacent context hunks
+        assert!(detect_hunk_header("...").is_none());
+    }
+
+    #[test]
+    fn empty_line_rejected() {
+        assert!(detect_hunk_header("").is_none());
+    }
+
+    // ── split_difft_output ────────────────────────────────────────────────────
+
+    #[test]
+    fn groups_multi_hunk_file() {
+        let input = "\
+src/git.rs --- 1/2 --- Rust\n\
+ 1  1 line one\n\
+src/git.rs --- 2/2 --- Rust\n\
+ 2  2 line two\n";
+        let result = split_difft_output(input);
+        assert_eq!(result.len(), 1, "both hunks should be in one entry");
+        assert_eq!(result[0].0, "src/git.rs");
+        // 4 rendered lines (two header lines + two content lines)
+        assert_eq!(result[0].1.len(), 4);
+    }
+
+    #[test]
+    fn separate_files_become_separate_entries() {
+        let input = "\
+.gitignore --- Text\n\
+ 1  1 /target\n\
+src/main.rs --- Rust\n\
+ 1  1 fn main() {}\n";
+        let result = split_difft_output(input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, ".gitignore");
+        assert_eq!(result[1].0, "src/main.rs");
+    }
+
+    #[test]
+    fn empty_input_gives_empty_result() {
+        assert!(split_difft_output("").is_empty());
+    }
 }

@@ -25,6 +25,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("Esc / q", "Back to list"),
     ("", ""),
     ("Both", ""),
+    ("T", "Open theme picker"),
     ("?", "Toggle this help"),
 ];
 

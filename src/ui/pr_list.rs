@@ -175,6 +175,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("a", "toggle mine/all"),
         ("r", "refresh"),
         ("o", "browser"),
+        ("T", "theme"),
         ("?", "help"),
         ("q", "quit"),
     ];
