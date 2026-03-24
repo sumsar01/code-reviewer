@@ -274,8 +274,10 @@ fn list_gh_accounts() -> Result<Vec<String>> {
         .output()
         .context("Running `gh auth status`")?;
 
-    // gh auth status writes to stderr
-    let text = String::from_utf8_lossy(&output.stderr);
+    // gh auth status may write to stdout (gh >= 2.x) or stderr (older gh).
+    // Combine both to be safe across versions.
+    let combined: Vec<u8> = output.stdout.iter().chain(output.stderr.iter()).copied().collect();
+    let text = String::from_utf8_lossy(&combined);
     let mut accounts = Vec::new();
     for line in text.lines() {
         // Lines look like:  "  ✓ Logged in to github.com account USERNAME (keyring)"

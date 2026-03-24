@@ -220,8 +220,14 @@ impl App {
                 };
             }
             KeyCode::Char('j') | KeyCode::Down => match self.detail_tab {
-                DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_add(1),
-                DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_add(1),
+                DetailTab::Diff => {
+                    let max = self.max_diff_scroll();
+                    self.diff_scroll = self.diff_scroll.saturating_add(1).min(max);
+                }
+                DetailTab::Comments => {
+                    let max = self.max_comments_scroll();
+                    self.comments_scroll = self.comments_scroll.saturating_add(1).min(max);
+                }
             },
             KeyCode::Char('k') | KeyCode::Up => match self.detail_tab {
                 DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(1),
@@ -293,7 +299,7 @@ impl App {
         tokio::spawn(async move {
             match gh.list_prs(&repo.owner, &repo.name, mine_only).await {
                 Ok(prs) => { let _ = tx.send(BgMsg::PrsLoaded(prs)); }
-                Err(e) => { let _ = tx.send(BgMsg::PrsError(e.to_string())); }
+                Err(e) => { let _ = tx.send(BgMsg::PrsError(format!("{:#}", e))); }
             }
         });
     }
@@ -309,7 +315,7 @@ impl App {
                     let files = parse_diff(&raw);
                     let _ = tx.send(BgMsg::DiffLoaded(files));
                 }
-                Err(e) => { let _ = tx.send(BgMsg::DiffError(e.to_string())); }
+                Err(e) => { let _ = tx.send(BgMsg::DiffError(format!("{:#}", e))); }
             }
         });
     }
@@ -322,9 +328,29 @@ impl App {
         tokio::spawn(async move {
             match gh.pr_comments(&repo.owner, &repo.name, pr_number).await {
                 Ok(comments) => { let _ = tx.send(BgMsg::CommentsLoaded(comments)); }
-                Err(e) => { let _ = tx.send(BgMsg::CommentsError(e.to_string())); }
+                Err(e) => { let _ = tx.send(BgMsg::CommentsError(format!("{:#}", e))); }
             }
         });
+    }
+
+    // ── Scroll helpers ────────────────────────────────────────────────────────
+
+    /// Total rendered lines for the current diff file (each hunk header + each diff line).
+    fn max_diff_scroll(&self) -> u16 {
+        let idx = self.diff_file_cursor.min(self.diff_files.len().saturating_sub(1));
+        let total: usize = self.diff_files.get(idx).map(|f| {
+            f.hunks.iter().map(|h| 1 + h.lines.len()).sum()
+        }).unwrap_or(0);
+        (total as u16).saturating_sub(1)
+    }
+
+    /// Total rendered lines for comments.
+    fn max_comments_scroll(&self) -> u16 {
+        // Each comment: 1 header line + body lines + 1 separator
+        let total: usize = self.pr_comments.iter().map(|c| {
+            1 + c.body.lines().count() + 1
+        }).sum();
+        (total as u16).saturating_sub(1)
     }
 
     // ── Actions ───────────────────────────────────────────────────────────────
