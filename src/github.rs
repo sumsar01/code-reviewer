@@ -62,7 +62,7 @@ pub struct DiffLine {
 }
 
 pub struct GitHubClient {
-    pub octo: Octocrab,
+    octo: Octocrab,
     pub username: String,
 }
 
