@@ -64,6 +64,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
         let paths: Vec<String> = app.diff_files.iter().map(|f| f.filename.clone()).collect();
         let rows = file_tree::build_rows(&paths);
         let focused = app.detail_focus == DetailFocus::FileTree;
+        let reviewed = app.reviewed_diff_indices();
         file_tree::render(
             f,
             &rows,
@@ -72,6 +73,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
             focused,
             chunks[0],
             t,
+            &reviewed,
         );
 
         chunks[1]

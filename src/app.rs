@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     process::Command,
     sync::Arc,
@@ -386,6 +386,9 @@ impl App {
                     let _ = open::that(&pr.url);
                 }
             }
+            KeyCode::Char('v') => {
+                self.toggle_reviewed();
+            }
             KeyCode::Char('c') => {
                 self.checkout_pr_branch();
             }
@@ -680,6 +683,95 @@ impl App {
         self.fetch_diff(pr_number);
         self.fetch_comments(pr_number);
         self.fetch_difft(base_sha, head_sha);
+    }
+
+    /// Returns the set of file indices (into `diff_files`) that are marked reviewed
+    /// for the currently open PR.
+    pub fn reviewed_diff_indices(&self) -> HashSet<usize> {
+        let Some(repo) = &self.repo else { return HashSet::new() };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return HashSet::new() };
+        self.diff_files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| self.config.is_reviewed(&repo.owner, &repo.name, pr.number, &f.filename))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Returns the set of file indices (into `difft_files`) that are marked reviewed
+    /// for the currently open PR.
+    pub fn reviewed_difft_indices(&self) -> HashSet<usize> {
+        let Some(repo) = &self.repo else { return HashSet::new() };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return HashSet::new() };
+        self.difft_files
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| self.config.is_reviewed(&repo.owner, &repo.name, pr.number, name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Returns (reviewed_count, total_count) for the current PR's diff files.
+    pub fn reviewed_progress(&self) -> (usize, usize) {
+        let total = self.diff_files.len();
+        let reviewed = self.reviewed_diff_indices().len();
+        (reviewed, total)
+    }
+
+    /// Toggle the current file's reviewed state and auto-advance to the next unreviewed file.
+    fn toggle_reviewed(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return };
+        let pr_number = pr.number;
+        let owner = repo.owner.clone();
+        let repo_name = repo.name.clone();
+
+        let (file_cursor, total_files) = match self.detail_tab {
+            DetailTab::Diff => (self.diff_file_cursor, self.diff_files.len()),
+            DetailTab::Difftastic => (self.difft_file_cursor, self.difft_files.len()),
+            DetailTab::Comments => return,
+        };
+
+        let filename = match self.detail_tab {
+            DetailTab::Diff => self.diff_files.get(file_cursor).map(|f| f.filename.clone()),
+            DetailTab::Difftastic => self.difft_files.get(file_cursor).map(|(n, _)| n.clone()),
+            DetailTab::Comments => None,
+        };
+        let Some(filename) = filename else { return };
+
+        self.config.toggle_reviewed(&owner, &repo_name, pr_number, &filename);
+
+        // Auto-advance to next unreviewed file (wrap around)
+        if total_files > 1 {
+            let next = (1..total_files)
+                .map(|offset| (file_cursor + offset) % total_files)
+                .find(|&idx| {
+                    let fname = match self.detail_tab {
+                        DetailTab::Diff => self.diff_files.get(idx).map(|f| f.filename.as_str()),
+                        DetailTab::Difftastic => {
+                            self.difft_files.get(idx).map(|(n, _)| n.as_str())
+                        }
+                        DetailTab::Comments => None,
+                    };
+                    fname.map_or(false, |f| {
+                        !self.config.is_reviewed(&owner, &repo_name, pr_number, f)
+                    })
+                });
+
+            if let Some(next_idx) = next {
+                match self.detail_tab {
+                    DetailTab::Diff => {
+                        self.diff_file_cursor = next_idx;
+                        self.diff_scroll = 0;
+                    }
+                    DetailTab::Difftastic => {
+                        self.difft_file_cursor = next_idx;
+                        self.difft_scroll = 0;
+                    }
+                    DetailTab::Comments => {}
+                }
+            }
+        }
     }
 
     fn checkout_pr_branch(&mut self) {

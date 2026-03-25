@@ -26,17 +26,24 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     };
 
     let area = f.area();
+    let (reviewed, total) = app.reviewed_progress();
+    // Header height: 2 borders + title + author + stats + reviewed (if files loaded)
+    // + review decision (if present) — cap at terminal height
+    let has_reviewed_line = total > 0;
+    let has_decision_line = pr.review_decision.is_some();
+    let header_height = 2 + 3 + u16::from(has_reviewed_line) + u16::from(has_decision_line);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // PR header (2 borders + up to 4 content lines)
-            Constraint::Length(2), // tabs (slim)
-            Constraint::Min(0),    // content
-            Constraint::Length(1), // status bar
+            Constraint::Length(header_height), // PR header
+            Constraint::Length(2),             // tabs (slim)
+            Constraint::Min(0),                // content
+            Constraint::Length(1),             // status bar
         ])
         .split(area);
 
-    render_pr_header(f, &pr, chunks[0], t);
+    render_pr_header(f, &pr, chunks[0], t, (reviewed, total));
     render_tabs(f, app, chunks[1], t);
 
     // Extract a reference to the syntax highlighter *before* the mutable borrow
@@ -55,8 +62,15 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     render_statusbar(f, chunks[3], t);
 }
 
-fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, t: &Theme) {
+fn render_pr_header(
+    f: &mut Frame,
+    pr: &crate::github::PullRequest,
+    area: Rect,
+    t: &Theme,
+    reviewed_progress: (usize, usize),
+) {
     let draft = if pr.draft { "  ▸DRAFT" } else { "" };
+    let (reviewed, total) = reviewed_progress;
 
     let mut lines = vec![
         // Title line
@@ -100,6 +114,24 @@ fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, 
             _ => vec![],
         }),
     ];
+
+    // Reviewed progress line (only shown when diff files are loaded)
+    if total > 0 {
+        let progress_color = if reviewed == total {
+            Color::Green
+        } else {
+            t.text_dim
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("{reviewed} / {total} files"),
+                Style::default()
+                    .fg(progress_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 
     // Review decision line (only shown when data is available)
     if let Some(decision) = pr.review_decision.as_deref() {
@@ -167,6 +199,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("Space", "toggle tree"),
         ("j/k", "scroll"),
         ("n/N", "next/prev file"),
+        ("v", "mark reviewed"),
         ("c", "checkout"),
         ("o", "browser"),
         ("T", "theme"),
