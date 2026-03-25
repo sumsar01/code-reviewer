@@ -52,6 +52,7 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
     let list_block = Block::default()
         .borders(Borders::ALL)
         .border_style(t.border_style())
+        .style(t.background_style())
         .title(Span::styled(
             " Theme ",
             Style::default()
@@ -74,7 +75,10 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
         spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
     }
 
-    f.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(t.background_style()),
+        chunks[1],
+    );
 }
 
 /// Compute a centered rect for the picker: 36 cols wide, auto-height.

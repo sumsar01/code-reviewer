@@ -1,4 +1,5 @@
 use crate::app::{App, DetailTab};
+use crate::syntax::SyntaxHighlighter;
 use crate::ui::{comments, diff, difftastic, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -28,10 +29,17 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     render_pr_header(f, &pr, chunks[0], t);
     render_tabs(f, app, chunks[1], t);
 
+    // Extract a reference to the syntax highlighter *before* the mutable borrow
+    // of `app` that happens inside diff::render.  We use a raw pointer to work
+    // around the borrow checker; this is safe because `syntax_hl` is not
+    // mutated by any code path below.
+    let hl_ptr: *const SyntaxHighlighter = &app.syntax_hl;
+    let hl: &SyntaxHighlighter = unsafe { &*hl_ptr };
+
     match app.detail_tab {
-        DetailTab::Diff => diff::render(f, app, chunks[2], t),
+        DetailTab::Diff => diff::render(f, app, chunks[2], t, hl),
         DetailTab::Comments => comments::render(f, app, chunks[2], t),
-        DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t),
+        DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t, hl),
     }
 
     render_statusbar(f, chunks[3], t);
@@ -87,6 +95,7 @@ fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, 
         Block::default()
             .borders(Borders::ALL)
             .border_style(t.border_style())
+            .style(t.background_style())
             .title(Span::styled(
                 " Pull Request ",
                 Style::default().fg(t.text_dim),
@@ -121,7 +130,8 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(t.border_dim_style()),
+                .border_style(t.border_dim_style())
+                .style(t.background_style()),
         )
         .highlight_style(t.tab_active_style())
         .divider(Span::styled(" │ ", t.border_dim_style()));
@@ -131,7 +141,8 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
 fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
     let hints: &[(&str, &str)] = &[
-        ("Tab", "switch pane"),
+        ("Tab", "focus tree/content"),
+        ("Space", "toggle tree"),
         ("j/k", "scroll"),
         ("n/N", "next/prev file"),
         ("c", "checkout"),
@@ -150,6 +161,6 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
     }
 
-    let p = Paragraph::new(Line::from(spans));
+    let p = Paragraph::new(Line::from(spans)).style(t.background_style());
     f.render_widget(p, area);
 }

@@ -69,7 +69,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ),
     ]);
 
-    let p = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
+    let p = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(t.background_style()),
+    );
     f.render_widget(p, area);
 }
 
@@ -78,14 +82,22 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         LoadState::Loading => {
             let p = Paragraph::new("  Loading pull requests…")
                 .style(t.text_dim_style())
-                .block(Block::default().borders(Borders::NONE));
+                .block(
+                    Block::default()
+                        .borders(Borders::NONE)
+                        .style(t.background_style()),
+                );
             f.render_widget(p, area);
             return;
         }
         LoadState::Error(e) => {
             let p = Paragraph::new(format!("  Error: {e}"))
                 .style(Style::default().fg(t.diff_removed_fg))
-                .block(Block::default().borders(Borders::NONE));
+                .block(
+                    Block::default()
+                        .borders(Borders::NONE)
+                        .style(t.background_style()),
+                );
             f.render_widget(p, area);
             return;
         }
@@ -98,9 +110,11 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         } else {
             "  No open PRs from you. Press 'a' to show all."
         };
-        let p = Paragraph::new(msg)
-            .style(t.text_dim_style())
-            .block(Block::default().borders(Borders::NONE));
+        let p = Paragraph::new(msg).style(t.text_dim_style()).block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(t.background_style()),
+        );
         f.render_widget(p, area);
         return;
     }
@@ -163,7 +177,8 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::TOP)
-            .border_style(t.border_dim_style()),
+            .border_style(t.border_dim_style())
+            .style(t.background_style()),
     );
     f.render_widget(list, area);
 }
@@ -189,6 +204,6 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
     }
 
-    let p = Paragraph::new(Line::from(spans));
+    let p = Paragraph::new(Line::from(spans)).style(t.background_style());
     f.render_widget(p, area);
 }

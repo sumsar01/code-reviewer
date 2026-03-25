@@ -16,7 +16,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(t.border_style()),
+                        .border_style(t.border_style())
+                        .style(t.background_style()),
                 );
             f.render_widget(p, area);
             return;
@@ -27,7 +28,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(t.border_style()),
+                        .border_style(t.border_style())
+                        .style(t.background_style()),
                 );
             f.render_widget(p, area);
             return;
@@ -40,6 +42,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
+                .style(t.background_style())
                 .title(Span::styled(" Comments ", Style::default().fg(t.text_dim))),
         );
         f.render_widget(p, area);
@@ -91,6 +94,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
+                .style(t.background_style())
                 .title(Span::styled(
                     format!(" Comments ({}) ", app.pr_comments.len()),
                     Style::default().fg(t.text_dim),

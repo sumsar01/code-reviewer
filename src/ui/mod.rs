@@ -1,6 +1,7 @@
 pub mod comments;
 pub mod diff;
 pub mod difftastic;
+pub mod file_tree;
 pub mod help;
 pub mod pr_detail;
 pub mod pr_list;
