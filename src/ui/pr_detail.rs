@@ -3,11 +3,21 @@ use crate::syntax::SyntaxHighlighter;
 use crate::ui::{comments, diff, difftastic, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
     Frame,
 };
+
+/// Return badge text and color for a review decision string.
+fn review_badge(decision: &str) -> (&'static str, Color) {
+    match decision {
+        "APPROVED" => ("✓ APPROVED", Color::Green),
+        "CHANGES_REQUESTED" => ("✗ CHANGES REQUESTED", Color::Red),
+        "REVIEW_REQUIRED" => ("? REVIEW REQUIRED", Color::Yellow),
+        _ => ("? REVIEW REQUIRED", Color::Yellow),
+    }
+}
 
 pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let pr = match app.prs.get(app.pr_cursor) {
@@ -19,7 +29,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // PR header
+            Constraint::Length(6), // PR header (2 borders + up to 4 content lines)
             Constraint::Length(2), // tabs (slim)
             Constraint::Min(0),    // content
             Constraint::Length(1), // status bar
@@ -48,7 +58,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
 fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, t: &Theme) {
     let draft = if pr.draft { "  ▸DRAFT" } else { "" };
 
-    let lines = vec![
+    let mut lines = vec![
         // Title line
         Line::from(vec![
             Span::styled(
@@ -90,6 +100,18 @@ fn render_pr_header(f: &mut Frame, pr: &crate::github::PullRequest, area: Rect, 
             _ => vec![],
         }),
     ];
+
+    // Review decision line (only shown when data is available)
+    if let Some(decision) = pr.review_decision.as_deref() {
+        let (text, color) = review_badge(decision);
+        lines.push(Line::from(vec![
+            Span::styled("Review: ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 
     let p = Paragraph::new(lines).block(
         Block::default()
