@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
 use octocrab::Octocrab;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::process::Command;
 
 /// A GitHub pull request (subset of fields we care about).
@@ -229,7 +231,79 @@ impl GitHubClient {
 
         Ok(result)
     }
+
+    /// Fetch `reviewDecision` for all open PRs in one GraphQL request.
+    ///
+    /// Returns a map from PR number → review decision string
+    /// (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"REVIEW_REQUIRED"`, or absent when `null`).
+    pub async fn fetch_review_decisions(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<HashMap<u64, String>> {
+        // GraphQL response shapes
+        #[derive(Deserialize)]
+        struct Response {
+            data: Option<Data>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        #[derive(Deserialize)]
+        struct Repository {
+            #[serde(rename = "pullRequests")]
+            pull_requests: Connection,
+        }
+        #[derive(Deserialize)]
+        struct Connection {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Node {
+            number: u64,
+            #[serde(rename = "reviewDecision")]
+            review_decision: Option<String>,
+        }
+
+        let query = r#"
+            query($owner: String!, $repo: String!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequests(states: OPEN, first: 100) {
+                  nodes {
+                    number
+                    reviewDecision
+                  }
+                }
+              }
+            }
+        "#;
+
+        let body = serde_json::json!({
+            "query": query,
+            "variables": { "owner": owner, "repo": repo }
+        });
+
+        let resp: Response = self
+            .octo
+            .graphql(&body)
+            .await
+            .with_context(|| format!("GraphQL reviewDecision query for {owner}/{repo}"))?;
+
+        let mut map = HashMap::new();
+        if let Some(data) = resp.data {
+            if let Some(repository) = data.repository {
+                for node in repository.pull_requests.nodes {
+                    if let Some(decision) = node.review_decision {
+                        map.insert(node.number, decision);
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
 }
+
 fn get_gh_token() -> Result<String> {
     gh_token_cmd(&["auth", "token"])
 }

@@ -8,6 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
+    collections::HashMap,
     io,
     process::Command,
     sync::Arc,
@@ -51,6 +52,7 @@ pub enum LoadState {
 enum BgMsg {
     PrsLoaded(Vec<PullRequest>),
     PrsError(String),
+    ReviewDecisionsLoaded(HashMap<u64, String>),
     DiffLoaded(Vec<DiffFile>),
     DiffError(String),
     CommentsLoaded(Vec<ReviewComment>),
@@ -469,9 +471,17 @@ impl App {
             BgMsg::PrsLoaded(prs) => {
                 self.prs = prs;
                 self.pr_load_state = LoadState::Idle;
+                self.fetch_review_decisions();
             }
             BgMsg::PrsError(e) => {
                 self.pr_load_state = LoadState::Error(e);
+            }
+            BgMsg::ReviewDecisionsLoaded(decisions) => {
+                for pr in &mut self.prs {
+                    if let Some(decision) = decisions.get(&pr.number) {
+                        pr.review_decision = Some(decision.clone());
+                    }
+                }
             }
             BgMsg::DiffLoaded(files) => {
                 self.diff_files = files;
@@ -514,6 +524,19 @@ impl App {
             match gh.list_prs(&repo.owner, &repo.name, mine_only).await {
                 Ok(prs) => { let _ = tx.send(BgMsg::PrsLoaded(prs)); }
                 Err(e) => { let _ = tx.send(BgMsg::PrsError(format!("{:#}", e))); }
+            }
+        });
+    }
+
+    fn fetch_review_decisions(&self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            match gh.fetch_review_decisions(&repo.owner, &repo.name).await {
+                Ok(decisions) => { let _ = tx.send(BgMsg::ReviewDecisionsLoaded(decisions)); }
+                Err(_) => {} // silently ignore — review decisions are best-effort
             }
         });
     }

@@ -2,7 +2,7 @@ use crate::app::{App, LoadState};
 use crate::ui::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -18,6 +18,16 @@ fn truncate(s: &str, max_chars: usize) -> String {
             .iter()
             .collect::<String>()
             + "…"
+    }
+}
+
+/// Return a short badge text and color for a review decision string.
+fn review_badge(decision: &str) -> (&'static str, Color) {
+    match decision {
+        "APPROVED" => ("✓ APPROVED", Color::Green),
+        "CHANGES_REQUESTED" => ("✗ CHANGES", Color::Red),
+        "REVIEW_REQUIRED" => ("? REVIEW", Color::Yellow),
+        _ => ("? REVIEW", Color::Yellow),
     }
 }
 
@@ -141,8 +151,19 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             };
             let stats = format!("{:>6} {:>6} {:>7}", additions, deletions, total);
 
+            // Badge text for review decision (empty string when none)
+            let badge_text = pr
+                .review_decision
+                .as_deref()
+                .map(|d| {
+                    let (text, _) = review_badge(d);
+                    format!("  {text}")
+                })
+                .unwrap_or_default();
+
             let inner_width = area.width.saturating_sub(2) as usize;
-            let fixed = 7 + 1 + 2 + 20 + 2 + stats.len() + if pr.draft { 8 } else { 0 };
+            let fixed =
+                7 + 1 + 2 + 20 + 2 + stats.len() + if pr.draft { 8 } else { 0 } + badge_text.len();
             let title_width = inner_width.saturating_sub(fixed);
             let title_display = truncate(&pr.title, title_width);
 
@@ -169,6 +190,15 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             spans.push(Span::styled(author, base_style.fg(t.pr_author)));
             spans.push(Span::styled("  ", base_style));
             spans.push(Span::styled(stats, base_style.fg(t.text_dim)));
+
+            // Append review decision badge if present
+            if let Some(decision) = pr.review_decision.as_deref() {
+                let (text, color) = review_badge(decision);
+                spans.push(Span::styled(
+                    format!("  {text}"),
+                    base_style.fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
 
             ListItem::new(Line::from(spans))
         })
