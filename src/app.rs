@@ -1,11 +1,12 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
 use crate::github::{DiffFile, GitHubClient, PullRequest, ReviewComment, parse_diff};
+use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::{Terminal, backend::CrosstermBackend, text::Line};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io,
     process::Command,
@@ -29,6 +30,15 @@ pub enum DetailTab {
     Difftastic,
 }
 
+/// Which panel inside the detail screen has keyboard focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailFocus {
+    /// The diff / comments / difftastic content area.
+    Content,
+    /// The file-tree sidebar.
+    FileTree,
+}
+
 #[derive(Debug, Clone)]
 pub enum LoadState {
     Idle,
@@ -45,7 +55,7 @@ enum BgMsg {
     DiffError(String),
     CommentsLoaded(Vec<ReviewComment>),
     CommentsError(String),
-    DifftLoaded(Vec<(String, Vec<Line<'static>>)>),
+    DifftLoaded(Vec<(String, String)>),
     DifftError(String),
 }
 
@@ -54,12 +64,16 @@ enum BgMsg {
 pub struct App {
     pub screen: Screen,
     pub detail_tab: DetailTab,
+    pub detail_focus: DetailFocus,
     pub show_help: bool,
+    pub show_file_tree: bool,
+    pub file_tree_cursor: usize,
     pub show_theme_picker: bool,
     pub theme_picker_cursor: usize,
     pub theme_picker_original: Option<Theme>,
     pub config: Config,
     pub theme: Theme,
+    pub syntax_hl: SyntaxHighlighter,
 
     pub repo: Option<RepoInfo>,
     pub github: Arc<GitHubClient>,
@@ -77,7 +91,7 @@ pub struct App {
     pub comments_scroll: u16,
     pub comments_load_state: LoadState,
 
-    pub difft_files: Vec<(String, Vec<Line<'static>>)>, // (filename, ansi lines)
+    pub difft_files: Vec<(String, String)>, // (filename, raw ansi output)
     pub difft_scroll: u16,
     pub difft_file_cursor: usize,
     pub difft_load_state: LoadState,
@@ -114,11 +128,15 @@ impl App {
         let app = Self {
             screen: Screen::PrList,
             detail_tab: DetailTab::Diff,
+            detail_focus: DetailFocus::Content,
             show_help: false,
+            show_file_tree: false,
+            file_tree_cursor: 0,
             show_theme_picker: false,
             theme_picker_cursor: Theme::index_of(&config.ui.theme),
             theme_picker_original: None,
             theme,
+            syntax_hl: SyntaxHighlighter::new(),
             config,
             repo,
             github,
@@ -269,6 +287,11 @@ impl App {
     }
 
     fn handle_key_detail(&mut self, code: KeyCode) -> bool {
+        // ── File-tree focus: intercept j/k/Enter/Esc ─────────────────────────
+        if self.detail_focus == DetailFocus::FileTree {
+            return self.handle_key_file_tree(code);
+        }
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.screen = Screen::PrList;
@@ -277,12 +300,35 @@ impl App {
                 self.diff_file_cursor = 0;
             }
             KeyCode::Char('?') => self.show_help = true,
+            // Space: toggle tree panel visibility
+            KeyCode::Char(' ') => {
+                match self.detail_tab {
+                    DetailTab::Diff | DetailTab::Difftastic => {
+                        self.show_file_tree = !self.show_file_tree;
+                        if !self.show_file_tree {
+                            self.detail_focus = DetailFocus::Content;
+                        }
+                    }
+                    DetailTab::Comments => {} // tree not shown on Comments tab
+                }
+            }
             KeyCode::Tab => {
-                self.detail_tab = match self.detail_tab {
-                    DetailTab::Diff => DetailTab::Comments,
-                    DetailTab::Comments => DetailTab::Difftastic,
-                    DetailTab::Difftastic => DetailTab::Diff,
-                };
+                if self.show_file_tree
+                    && matches!(self.detail_tab, DetailTab::Diff | DetailTab::Difftastic)
+                {
+                    // Cycle focus: Content → FileTree → Content
+                    self.detail_focus = match self.detail_focus {
+                        DetailFocus::Content => DetailFocus::FileTree,
+                        DetailFocus::FileTree => DetailFocus::Content,
+                    };
+                } else {
+                    // No tree visible: cycle tabs as before
+                    self.detail_tab = match self.detail_tab {
+                        DetailTab::Diff => DetailTab::Comments,
+                        DetailTab::Comments => DetailTab::Difftastic,
+                        DetailTab::Difftastic => DetailTab::Diff,
+                    };
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => match self.detail_tab {
                 DetailTab::Diff => {
@@ -345,6 +391,71 @@ impl App {
                 self.theme_picker_original = Some(self.theme.clone());
                 self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
                 self.show_theme_picker = true;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Key handler when the file-tree sidebar has focus.
+    fn handle_key_file_tree(&mut self, code: KeyCode) -> bool {
+        use crate::ui::file_tree;
+
+        // Build current rows so we can do index arithmetic.
+        let rows: Vec<file_tree::TreeRow> = match self.detail_tab {
+            DetailTab::Diff => {
+                let paths: Vec<String> =
+                    self.diff_files.iter().map(|f| f.filename.clone()).collect();
+                file_tree::build_rows(&paths)
+            }
+            DetailTab::Difftastic => {
+                let paths: Vec<String> =
+                    self.difft_files.iter().map(|(n, _)| n.clone()).collect();
+                file_tree::build_rows(&paths)
+            }
+            DetailTab::Comments => {
+                // Tree not shown on Comments; transfer focus back
+                self.detail_focus = DetailFocus::Content;
+                return false;
+            }
+        };
+
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !rows.is_empty() {
+                    self.file_tree_cursor =
+                        (self.file_tree_cursor + 1).min(rows.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.file_tree_cursor = self.file_tree_cursor.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                // Jump to the file the cursor points at (skip directory rows)
+                if let Some(row) = rows.get(self.file_tree_cursor) {
+                    if let Some(file_idx) = row.file_index {
+                        match self.detail_tab {
+                            DetailTab::Diff => {
+                                self.diff_file_cursor = file_idx;
+                                self.diff_scroll = 0;
+                            }
+                            DetailTab::Difftastic => {
+                                self.difft_file_cursor = file_idx;
+                                self.difft_scroll = 0;
+                            }
+                            DetailTab::Comments => {}
+                        }
+                        // Move focus back to content after selecting
+                        self.detail_focus = DetailFocus::Content;
+                    }
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Esc => {
+                // Close tree / return focus to content
+                self.detail_focus = DetailFocus::Content;
+            }
+            KeyCode::Tab => {
+                self.detail_focus = DetailFocus::Content;
             }
             _ => {}
         }
@@ -467,10 +578,10 @@ impl App {
             let output = std::process::Command::new("git")
                 .args([
                     "-c",
-                    "diff.external=difft --color=always",
+                    "diff.external=difft --color=always --skip-unchanged",
                     "diff",
                     "--ext-diff",
-                    &format!("{}..{}", base_sha, head_sha),
+                    &format!("{}...{}", base_sha, head_sha),
                 ])
                 .current_dir(&workdir)
                 .output();
@@ -520,7 +631,9 @@ impl App {
     /// Total rendered lines for the current difftastic file output.
     fn max_difft_scroll(&self) -> u16 {
         let idx = self.difft_file_cursor.min(self.difft_files.len().saturating_sub(1));
-        let total = self.difft_files.get(idx).map(|(_, lines)| lines.len()).unwrap_or(0);
+        let total = self.difft_files.get(idx)
+            .map(|(_, raw)| raw.lines().count())
+            .unwrap_or(0);
         (total as u16).saturating_sub(1)
     }
 
@@ -578,7 +691,7 @@ impl App {
 ///
 /// We detect hunk headers, group all hunks for the same filename into one
 /// entry, and include every hunk header line so the TUI shows them in context.
-fn split_difft_output(stdout: &str) -> Vec<(String, Vec<Line<'static>>)> {
+fn split_difft_output(stdout: &str) -> Vec<(String, String)> {
     // Collect (filename, hunk_index, raw_line_slice) tuples first.
     // hunk_index = 1 for "first hunk of a file" (or 0 when no counter).
     let mut sections: Vec<(String, usize, Vec<&str>)> = Vec::new();
@@ -606,20 +719,20 @@ fn split_difft_output(stdout: &str) -> Vec<(String, Vec<Line<'static>>)> {
 
     // Merge hunks that belong to the same file into a single entry.
     // A new file starts when hunk_index == 1 (or 0 for single-hunk files).
-    let mut results: Vec<(String, Vec<Line<'static>>)> = Vec::new();
+    // Store the raw ANSI string so the render path can apply treesitter highlighting.
+    let mut results: Vec<(String, String)> = Vec::new();
 
     for (filename, hunk_idx, raw_lines) in sections {
         let is_new_file = hunk_idx <= 1;
 
         if is_new_file {
-            // Start a fresh entry.
-            let parsed = crate::ui::difftastic::parse_ansi_to_lines(&raw_lines.join("\n"));
-            results.push((filename, parsed));
+            // Start a fresh entry — store raw ANSI text.
+            results.push((filename, raw_lines.join("\n")));
         } else {
             // Append to the last entry (same file, subsequent hunk).
             if let Some(last) = results.last_mut() {
-                let extra = crate::ui::difftastic::parse_ansi_to_lines(&raw_lines.join("\n"));
-                last.1.extend(extra);
+                last.1.push('\n');
+                last.1.push_str(&raw_lines.join("\n"));
             }
         }
     }
@@ -782,8 +895,8 @@ src/git.rs --- 2/2 --- Rust\n\
         let result = split_difft_output(input);
         assert_eq!(result.len(), 1, "both hunks should be in one entry");
         assert_eq!(result[0].0, "src/git.rs");
-        // 4 rendered lines (two header lines + two content lines)
-        assert_eq!(result[0].1.len(), 4);
+        // 4 raw lines (two header lines + two content lines)
+        assert_eq!(result[0].1.lines().count(), 4);
     }
 
     #[test]

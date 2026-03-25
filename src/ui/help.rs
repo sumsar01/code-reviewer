@@ -61,6 +61,7 @@ pub fn render(f: &mut Frame, t: &Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
+                .style(t.background_style())
                 .title(Span::styled(
                     " Help — press ? to close ",
                     Style::default()

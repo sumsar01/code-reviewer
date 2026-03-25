@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod git;
 mod github;
+mod syntax;
 mod ui;
 
 use anyhow::Result;
