@@ -4,7 +4,7 @@ use crate::syntax::SyntaxHighlighter;
 use crate::ui::{file_tree, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -84,13 +84,23 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
     let total_files = app.diff_files.len();
     let cur_file_idx = app.diff_file_cursor.min(total_files.saturating_sub(1));
     let file = &app.diff_files[cur_file_idx];
-    let title = format!(" {} ({}/{}) ", file.filename, cur_file_idx + 1, total_files);
+    let base_title = format!(" {} ({}/{}) ", file.filename, cur_file_idx + 1, total_files);
+
+    let is_reviewed = app.reviewed_diff_indices().contains(&cur_file_idx);
+    let title: Line<'static> = if is_reviewed {
+        Line::from(vec![
+            Span::styled(base_title, t.text_accent_style()),
+            Span::styled("[reviewed] ", Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(Span::styled(base_title, t.text_accent_style()))
+    };
 
     let wide = diff_area.width >= SPLIT_THRESHOLD;
     if wide {
-        render_side_by_side(f, file, app.diff_scroll, diff_area, &title, t, hl);
+        render_side_by_side(f, file, app.diff_scroll, diff_area, title, t, hl);
     } else {
-        render_unified(f, file, app.diff_scroll, diff_area, &title, t, hl);
+        render_unified(f, file, app.diff_scroll, diff_area, title, t, hl);
     }
 }
 
@@ -228,7 +238,7 @@ fn render_unified(
     file: &DiffFile,
     scroll: u16,
     area: Rect,
-    title: &str,
+    title: Line<'static>,
     t: &Theme,
     hl: &SyntaxHighlighter,
 ) {
@@ -239,7 +249,7 @@ fn render_unified(
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
                 .style(t.background_style())
-                .title(Span::styled(title.to_string(), t.text_accent_style())),
+                .title(title),
         )
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -334,7 +344,7 @@ fn render_side_by_side(
     file: &DiffFile,
     scroll: u16,
     area: Rect,
-    title: &str,
+    title: Line<'static>,
     t: &Theme,
     hl: &SyntaxHighlighter,
 ) {
@@ -351,7 +361,8 @@ fn render_side_by_side(
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
                 .style(t.background_style())
-                .title(Span::styled(format!("{title} before"), t.text_dim_style())),
+                .title(title)
+                .title_bottom(Span::styled(" before ", t.text_dim_style())),
         )
         .scroll((scroll, 0));
     let right_p = Paragraph::new(right_lines)

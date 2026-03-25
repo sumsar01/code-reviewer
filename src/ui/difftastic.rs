@@ -4,7 +4,7 @@ use crate::ui::{file_tree, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    text::Span,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
@@ -94,7 +94,17 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
     let total_files = app.difft_files.len();
     let cur_file_idx = app.difft_file_cursor.min(total_files.saturating_sub(1));
     let (filename, raw_ansi) = &app.difft_files[cur_file_idx];
-    let title = format!(" {} ({}/{}) ", filename, cur_file_idx + 1, total_files);
+    let base_title = format!(" {} ({}/{}) ", filename, cur_file_idx + 1, total_files);
+
+    let is_reviewed = app.reviewed_difft_indices().contains(&cur_file_idx);
+    let title: Line<'static> = if is_reviewed {
+        Line::from(vec![
+            Span::styled(base_title, t.text_accent_style()),
+            Span::styled("[reviewed] ", Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(Span::styled(base_title, t.text_accent_style()))
+    };
 
     let lines = parse_ansi_to_lines_with_syntax(raw_ansi, filename, hl, t);
 
@@ -104,7 +114,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
                 .borders(Borders::ALL)
                 .border_style(t.border_style())
                 .style(t.background_style())
-                .title(Span::styled(title, t.text_accent_style())),
+                .title(title),
         )
         .scroll((app.difft_scroll, 0));
     f.render_widget(p, content_area);

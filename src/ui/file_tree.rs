@@ -146,33 +146,23 @@ pub fn render(
                     .fg(t.selection_fg)
                     .add_modifier(Modifier::BOLD)
             } else if is_active_file {
-                // Currently-viewed file (accent color even without focus)
+                // Currently-viewed file: accent color, full brightness (overrides reviewed)
                 Style::default()
                     .fg(t.text_accent)
                     .add_modifier(Modifier::BOLD)
             } else if is_reviewed {
-                // Reviewed files: dimmed to indicate "done"
-                Style::default().fg(t.text_dim).add_modifier(Modifier::DIM)
+                // Reviewed files: struck-through + dim to indicate "done"
+                Style::default()
+                    .fg(t.text_dim)
+                    .add_modifier(Modifier::CROSSED_OUT)
+                    .add_modifier(Modifier::DIM)
             } else if is_dir {
                 Style::default().fg(t.text_dim)
             } else {
                 Style::default().fg(t.text)
             };
 
-            // Determine the prefix:
-            //   ▶  active file (takes precedence over reviewed state)
-            //   ☑  reviewed file
-            //   ☐  unreviewed file
-            //   (space) directory
-            let prefix = if is_active_file {
-                "▶ "
-            } else if is_dir {
-                "  "
-            } else if is_reviewed {
-                "☑ "
-            } else {
-                "☐ "
-            };
+            let prefix = if is_active_file { "▶ " } else { "  " };
 
             ListItem::new(Line::from(Span::styled(
                 format!("{}{}", prefix, row.label),
