@@ -415,7 +415,7 @@ impl GitHubClient {
         let query = r#"
             query($owner: String!, $repo: String!, $sha: String!) {
               repository(owner: $owner, name: $repo) {
-                object(expression: $sha) {
+                object(oid: $sha) {
                   ... on Commit {
                     checkSuites(first: 20) {
                       nodes {
