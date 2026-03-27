@@ -424,7 +424,7 @@ impl GitHubClient {
         }
 
         let query = r#"
-            query($owner: String!, $repo: String!, $sha: String!) {
+            query($owner: String!, $repo: String!, $sha: GitObjectID!) {
               repository(owner: $owner, name: $repo) {
                 object(oid: $sha) {
                   ... on Commit {
