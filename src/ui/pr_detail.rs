@@ -32,9 +32,11 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let has_reviewed_line = total > 0;
     let has_decision_line = pr.review_decision.is_some();
     let check_runs_lines = check_runs_line_count(&app.check_runs_load_state, &app.check_runs);
-    // 2 borders + title + author + stats + optional lines
-    let header_height =
-        2 + 3 + u16::from(has_reviewed_line) + u16::from(has_decision_line) + check_runs_lines;
+    // Layout: first 3 lines (title/author/stats) span full width.
+    // Below that, left col = reviewed + decision, right col = CI checks.
+    // Height = 3 fixed + max(left optional lines, right CI lines) + 2 borders.
+    let left_optional = u16::from(has_reviewed_line) + u16::from(has_decision_line);
+    let header_height = 2 + 3 + left_optional.max(check_runs_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -85,8 +87,20 @@ fn render_pr_header(
     let draft = if pr.draft { "  ▸DRAFT" } else { "" };
     let (reviewed, total) = reviewed_progress;
 
-    let mut lines = vec![
-        // Title line
+    // ── Outer border block ────────────────────────────────────────────────────
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(t.border_style())
+        .style(t.background_style())
+        .title(Span::styled(
+            " Pull Request ",
+            Style::default().fg(t.text_dim),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // ── Top 3 lines: title / author / stats (full width) ─────────────────────
+    let top_lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("#{} ", pr.number),
@@ -99,7 +113,6 @@ fn render_pr_header(
                 Style::default().fg(t.text).add_modifier(Modifier::BOLD),
             ),
         ]),
-        // Author + branch line
         Line::from(vec![
             Span::styled("by ", Style::default().fg(t.text_dim)),
             Span::styled(
@@ -113,7 +126,6 @@ fn render_pr_header(
             Span::styled(" → ", Style::default().fg(t.text_dim)),
             Span::styled(pr.base_branch.clone(), Style::default().fg(t.text_dim)),
         ]),
-        // Stats line
         Line::from(match (pr.additions, pr.deletions, pr.changed_files) {
             (Some(a), Some(d), Some(c)) => vec![
                 Span::styled(format!("+{a}"), Style::default().fg(t.stats_added)),
@@ -128,89 +140,153 @@ fn render_pr_header(
         }),
     ];
 
-    // Reviewed progress line (only shown when diff files are loaded)
-    if total > 0 {
-        let progress_color = if reviewed == total {
-            Color::Green
-        } else {
-            t.text_dim
-        };
-        lines.push(Line::from(vec![
-            Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                format!("{reviewed} / {total} files"),
-                Style::default()
-                    .fg(progress_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    // Top section spans full inner width, exactly 3 rows tall.
+    let top_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 3.min(inner.height),
+    };
+    f.render_widget(
+        Paragraph::new(top_lines).style(t.background_style()),
+        top_area,
+    );
+
+    // Nothing left to render below the top section.
+    if inner.height <= 3 {
+        return;
     }
 
-    // Review decision line (only shown when data is available)
-    if let Some(decision) = pr.review_decision.as_deref() {
-        let (text, color) = review_badge(decision);
-        lines.push(Line::from(vec![
-            Span::styled("Review: ", Style::default().fg(t.text_dim)),
-            Span::styled(
-                text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
+    // ── Bottom section: left col (reviewed/decision) | right col (CI) ────────
+    let bottom_area = Rect {
+        x: inner.x,
+        y: inner.y + 3,
+        width: inner.width,
+        height: inner.height - 3,
+    };
 
-    // CI check runs section
-    match check_runs_load_state {
-        LoadState::Loading => {
-            lines.push(Line::from(vec![
-                Span::styled("CI: ", Style::default().fg(t.text_dim)),
-                Span::styled("loading…", Style::default().fg(t.text_dim)),
+    let has_ci = !matches!(check_runs_load_state, LoadState::Idle) || !check_runs.is_empty();
+
+    if has_ci {
+        // Split horizontally: left 55% | right 45%
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(bottom_area);
+
+        // Left col: reviewed progress + review decision
+        let mut left_lines: Vec<Line> = Vec::new();
+        if total > 0 {
+            let progress_color = if reviewed == total {
+                Color::Green
+            } else {
+                t.text_dim
+            };
+            left_lines.push(Line::from(vec![
+                Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    format!("{reviewed} / {total} files"),
+                    Style::default()
+                        .fg(progress_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
-        LoadState::Idle if !check_runs.is_empty() => {
-            lines.push(Line::from(Span::styled(
-                "CI Checks:",
-                Style::default().fg(t.text_dim),
-            )));
-            for run in check_runs {
-                let (icon, color) = check_run_icon(run);
-                let conclusion_label = run
-                    .conclusion
-                    .as_deref()
-                    .unwrap_or(run.status.as_str())
-                    .to_lowercase();
-                let duration =
-                    format_duration(run.started_at.as_deref(), run.completed_at.as_deref());
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {icon}  ",),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(run.name.clone(), Style::default().fg(t.text)),
-                    Span::styled(format!("  {conclusion_label}"), Style::default().fg(color)),
-                    Span::styled(format!("  {duration}"), Style::default().fg(t.text_dim)),
+        if let Some(decision) = pr.review_decision.as_deref() {
+            let (text, color) = review_badge(decision);
+            left_lines.push(Line::from(vec![
+                Span::styled("Review: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(left_lines).style(t.background_style()),
+            cols[0],
+        );
+
+        // Right col: CI checks
+        let mut ci_lines: Vec<Line> = Vec::new();
+        match check_runs_load_state {
+            LoadState::Loading => {
+                ci_lines.push(Line::from(vec![
+                    Span::styled("CI: ", Style::default().fg(t.text_dim)),
+                    Span::styled("loading…", Style::default().fg(t.text_dim)),
                 ]));
             }
+            LoadState::Idle if !check_runs.is_empty() => {
+                ci_lines.push(Line::from(Span::styled(
+                    "CI Checks:",
+                    Style::default().fg(t.text_dim),
+                )));
+                for run in check_runs {
+                    let (icon, color) = check_run_icon(run);
+                    let conclusion_label = run
+                        .conclusion
+                        .as_deref()
+                        .unwrap_or(run.status.as_str())
+                        .to_lowercase();
+                    let duration =
+                        format_duration(run.started_at.as_deref(), run.completed_at.as_deref());
+                    ci_lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {icon}  "),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(run.name.clone(), Style::default().fg(t.text)),
+                        Span::styled(format!("  {conclusion_label}"), Style::default().fg(color)),
+                        Span::styled(format!("  {duration}"), Style::default().fg(t.text_dim)),
+                    ]));
+                }
+            }
+            LoadState::Error(e) => {
+                ci_lines.push(Line::from(vec![
+                    Span::styled("CI: ", Style::default().fg(t.text_dim)),
+                    Span::styled(format!("error: {e}"), Style::default().fg(Color::Red)),
+                ]));
+            }
+            _ => {}
         }
-        LoadState::Error(e) => {
-            lines.push(Line::from(vec![
-                Span::styled("CI: ", Style::default().fg(t.text_dim)),
-                Span::styled(format!("error: {e}"), Style::default().fg(Color::Red)),
+        f.render_widget(
+            Paragraph::new(ci_lines).style(t.background_style()),
+            cols[1],
+        );
+    } else {
+        // No CI data at all — single column for reviewed/decision only.
+        let mut left_lines: Vec<Line> = Vec::new();
+        if total > 0 {
+            let progress_color = if reviewed == total {
+                Color::Green
+            } else {
+                t.text_dim
+            };
+            left_lines.push(Line::from(vec![
+                Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    format!("{reviewed} / {total} files"),
+                    Style::default()
+                        .fg(progress_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
-        _ => {}
+        if let Some(decision) = pr.review_decision.as_deref() {
+            let (text, color) = review_badge(decision);
+            left_lines.push(Line::from(vec![
+                Span::styled("Review: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(left_lines).style(t.background_style()),
+            bottom_area,
+        );
     }
-
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(t.border_style())
-            .style(t.background_style())
-            .title(Span::styled(
-                " Pull Request ",
-                Style::default().fg(t.text_dim),
-            )),
-    );
-    f.render_widget(p, area);
 }
 
 /// Return (icon, color) for a check run based on status + conclusion.
