@@ -1,4 +1,5 @@
-use crate::app::{App, DetailTab};
+use crate::app::{App, DetailTab, LoadState};
+use crate::github::CheckRun;
 use crate::syntax::SyntaxHighlighter;
 use crate::ui::{comments, diff, difftastic, theme::Theme};
 use ratatui::{
@@ -27,11 +28,13 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
 
     let area = f.area();
     let (reviewed, total) = app.reviewed_progress();
-    // Header height: 2 borders + title + author + stats + reviewed (if files loaded)
-    // + review decision (if present) — cap at terminal height
+
     let has_reviewed_line = total > 0;
     let has_decision_line = pr.review_decision.is_some();
-    let header_height = 2 + 3 + u16::from(has_reviewed_line) + u16::from(has_decision_line);
+    let check_runs_lines = check_runs_line_count(&app.check_runs_load_state, &app.check_runs);
+    // 2 borders + title + author + stats + optional lines
+    let header_height =
+        2 + 3 + u16::from(has_reviewed_line) + u16::from(has_decision_line) + check_runs_lines;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -43,7 +46,15 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
         ])
         .split(area);
 
-    render_pr_header(f, &pr, chunks[0], t, (reviewed, total));
+    render_pr_header(
+        f,
+        &pr,
+        chunks[0],
+        t,
+        (reviewed, total),
+        &app.check_runs_load_state,
+        &app.check_runs,
+    );
     render_tabs(f, app, chunks[1], t);
 
     // Extract a reference to the syntax highlighter *before* the mutable borrow
@@ -68,6 +79,8 @@ fn render_pr_header(
     area: Rect,
     t: &Theme,
     reviewed_progress: (usize, usize),
+    check_runs_load_state: &LoadState,
+    check_runs: &[CheckRun],
 ) {
     let draft = if pr.draft { "  ▸DRAFT" } else { "" };
     let (reviewed, total) = reviewed_progress;
@@ -145,6 +158,48 @@ fn render_pr_header(
         ]));
     }
 
+    // CI check runs section
+    match check_runs_load_state {
+        LoadState::Loading => {
+            lines.push(Line::from(vec![
+                Span::styled("CI: ", Style::default().fg(t.text_dim)),
+                Span::styled("loading…", Style::default().fg(t.text_dim)),
+            ]));
+        }
+        LoadState::Idle if !check_runs.is_empty() => {
+            lines.push(Line::from(Span::styled(
+                "CI Checks:",
+                Style::default().fg(t.text_dim),
+            )));
+            for run in check_runs {
+                let (icon, color) = check_run_icon(run);
+                let conclusion_label = run
+                    .conclusion
+                    .as_deref()
+                    .unwrap_or(run.status.as_str())
+                    .to_lowercase();
+                let duration =
+                    format_duration(run.started_at.as_deref(), run.completed_at.as_deref());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {icon}  ",),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(run.name.clone(), Style::default().fg(t.text)),
+                    Span::styled(format!("  {conclusion_label}"), Style::default().fg(color)),
+                    Span::styled(format!("  {duration}"), Style::default().fg(t.text_dim)),
+                ]));
+            }
+        }
+        LoadState::Error(e) => {
+            lines.push(Line::from(vec![
+                Span::styled("CI: ", Style::default().fg(t.text_dim)),
+                Span::styled(format!("error: {e}"), Style::default().fg(Color::Red)),
+            ]));
+        }
+        _ => {}
+    }
+
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
@@ -156,6 +211,58 @@ fn render_pr_header(
             )),
     );
     f.render_widget(p, area);
+}
+
+/// Return (icon, color) for a check run based on status + conclusion.
+fn check_run_icon(run: &CheckRun) -> (&'static str, Color) {
+    match run.status.as_str() {
+        "COMPLETED" => match run.conclusion.as_deref().unwrap_or("") {
+            "SUCCESS" | "SKIPPED" | "NEUTRAL" => ("✓", Color::Green),
+            "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" => ("✗", Color::Red),
+            "CANCELLED" => ("✗", Color::DarkGray),
+            _ => ("◌", Color::DarkGray),
+        },
+        "IN_PROGRESS" => ("↻", Color::Yellow),
+        _ => ("◌", Color::DarkGray), // QUEUED or unknown
+    }
+}
+
+/// Compute "Xm Ys" duration from ISO-8601 strings, or "—" if unavailable.
+fn format_duration(started: Option<&str>, completed: Option<&str>) -> String {
+    let (Some(s), Some(c)) = (started, completed) else {
+        return "—".to_string();
+    };
+    // Parse only the time portion for a quick heuristic — we just need seconds.
+    // Full ISO-8601: "2024-01-15T10:23:45Z"
+    let parse_secs = |ts: &str| -> Option<i64> {
+        // Use a naive parse: split on 'T', then parse HH:MM:SS
+        let time_part = ts.split('T').nth(1)?;
+        let hms: Vec<&str> = time_part.trim_end_matches('Z').split(':').collect();
+        if hms.len() < 3 {
+            return None;
+        }
+        let h: i64 = hms[0].parse().ok()?;
+        let m: i64 = hms[1].parse().ok()?;
+        let s: i64 = hms[2].split('.').next()?.parse().ok()?;
+        Some(h * 3600 + m * 60 + s)
+    };
+    if let (Some(s_secs), Some(c_secs)) = (parse_secs(s), parse_secs(c)) {
+        let elapsed = (c_secs - s_secs).abs();
+        let mins = elapsed / 60;
+        let secs = elapsed % 60;
+        return format!("{mins}m {secs:02}s");
+    }
+    "—".to_string()
+}
+
+/// Number of lines the CI checks section will occupy in the header.
+fn check_runs_line_count(state: &LoadState, runs: &[CheckRun]) -> u16 {
+    match state {
+        LoadState::Loading => 1,
+        LoadState::Idle if !runs.is_empty() => 1 + runs.len() as u16, // header line + one per run
+        LoadState::Error(_) => 1,
+        _ => 0,
+    }
 }
 
 fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {

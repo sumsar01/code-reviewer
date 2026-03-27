@@ -22,6 +22,7 @@ pub struct PullRequest {
     pub deletions: Option<i64>,
     pub changed_files: Option<i64>,
     pub review_decision: Option<String>,
+    pub ci_status: Option<String>,
     pub body: Option<String>,
 }
 
@@ -61,6 +62,24 @@ pub struct DiffLine {
     pub left_no: Option<usize>,
     pub right_no: Option<usize>,
     pub content: String,
+}
+
+/// Combined per-PR metadata fetched in one GraphQL round-trip.
+pub struct PrMetadata {
+    pub review_decisions: HashMap<u64, String>,
+    pub ci_statuses: HashMap<u64, String>,
+}
+
+/// A single CI check run on a commit.
+#[derive(Debug, Clone)]
+pub struct CheckRun {
+    pub name: String,
+    /// "QUEUED" | "IN_PROGRESS" | "COMPLETED"
+    pub status: String,
+    /// "SUCCESS" | "FAILURE" | "SKIPPED" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | None
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 pub struct GitHubClient {
@@ -179,6 +198,7 @@ impl GitHubClient {
                     deletions: pr.deletions.map(|v| v as i64),
                     changed_files: pr.changed_files.map(|v| v as i64),
                     review_decision: None,
+                    ci_status: None,
                     body: pr.body.clone(),
                 });
             }
@@ -232,15 +252,18 @@ impl GitHubClient {
         Ok(result)
     }
 
-    /// Fetch `reviewDecision` for all open PRs in one GraphQL request.
+    /// Fetch `reviewDecision` and CI `statusCheckRollup` for all open PRs in one
+    /// GraphQL request.
     ///
-    /// Returns a map from PR number → review decision string
-    /// (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"REVIEW_REQUIRED"`, or absent when `null`).
+    /// Returns a `PrMetadata` with maps from PR number → review decision string
+    /// (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"REVIEW_REQUIRED"`, or absent when `null`)
+    /// and PR number → CI state string (`"SUCCESS"`, `"FAILURE"`, `"PENDING"`,
+    /// `"ERROR"`, `"EXPECTED"`, or absent when there are no checks).
     pub async fn fetch_review_decisions(
         &self,
         owner: &str,
         repo: &str,
-    ) -> Result<HashMap<u64, String>> {
+    ) -> Result<PrMetadata> {
         // GraphQL response shapes
         #[derive(Deserialize)]
         struct Response {
@@ -264,6 +287,24 @@ impl GitHubClient {
             number: u64,
             #[serde(rename = "reviewDecision")]
             review_decision: Option<String>,
+            commits: CommitConnection,
+        }
+        #[derive(Deserialize)]
+        struct CommitConnection {
+            nodes: Vec<CommitNode>,
+        }
+        #[derive(Deserialize)]
+        struct CommitNode {
+            commit: CommitObj,
+        }
+        #[derive(Deserialize)]
+        struct CommitObj {
+            #[serde(rename = "statusCheckRollup")]
+            status_check_rollup: Option<StatusRollup>,
+        }
+        #[derive(Deserialize)]
+        struct StatusRollup {
+            state: String,
         }
 
         let query = r#"
@@ -273,6 +314,15 @@ impl GitHubClient {
                   nodes {
                     number
                     reviewDecision
+                    commits(last: 1) {
+                      nodes {
+                        commit {
+                          statusCheckRollup {
+                            state
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -288,19 +338,138 @@ impl GitHubClient {
             .octo
             .graphql(&body)
             .await
-            .with_context(|| format!("GraphQL reviewDecision query for {owner}/{repo}"))?;
+            .with_context(|| format!("GraphQL reviewDecision+CI query for {owner}/{repo}"))?;
 
-        let mut map = HashMap::new();
+        let mut review_decisions = HashMap::new();
+        let mut ci_statuses = HashMap::new();
         if let Some(data) = resp.data {
             if let Some(repository) = data.repository {
                 for node in repository.pull_requests.nodes {
                     if let Some(decision) = node.review_decision {
-                        map.insert(node.number, decision);
+                        review_decisions.insert(node.number, decision);
+                    }
+                    if let Some(ci_state) = node
+                        .commits
+                        .nodes
+                        .first()
+                        .and_then(|cn| cn.commit.status_check_rollup.as_ref())
+                        .map(|r| r.state.clone())
+                    {
+                        ci_statuses.insert(node.number, ci_state);
                     }
                 }
             }
         }
-        Ok(map)
+        Ok(PrMetadata { review_decisions, ci_statuses })
+    }
+
+    /// Fetch individual CI check runs for a specific commit SHA.
+    /// Returns a flat list of check runs across all check suites.
+    pub async fn fetch_check_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        head_sha: &str,
+    ) -> Result<Vec<CheckRun>> {
+        #[derive(Deserialize)]
+        struct Response {
+            data: Option<Data>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        #[derive(Deserialize)]
+        struct Repository {
+            object: Option<GitObject>,
+        }
+        #[derive(Deserialize)]
+        struct GitObject {
+            #[serde(rename = "checkSuites")]
+            check_suites: Option<CheckSuiteConnection>,
+        }
+        #[derive(Deserialize)]
+        struct CheckSuiteConnection {
+            nodes: Vec<CheckSuiteNode>,
+        }
+        #[derive(Deserialize)]
+        struct CheckSuiteNode {
+            #[serde(rename = "checkRuns")]
+            check_runs: Option<CheckRunConnection>,
+        }
+        #[derive(Deserialize)]
+        struct CheckRunConnection {
+            nodes: Vec<CheckRunNode>,
+        }
+        #[derive(Deserialize)]
+        struct CheckRunNode {
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+            #[serde(rename = "startedAt")]
+            started_at: Option<String>,
+            #[serde(rename = "completedAt")]
+            completed_at: Option<String>,
+        }
+
+        let query = r#"
+            query($owner: String!, $repo: String!, $sha: String!) {
+              repository(owner: $owner, name: $repo) {
+                object(expression: $sha) {
+                  ... on Commit {
+                    checkSuites(first: 20) {
+                      nodes {
+                        checkRuns(first: 50) {
+                          nodes {
+                            name
+                            status
+                            conclusion
+                            startedAt
+                            completedAt
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+
+        let body = serde_json::json!({
+            "query": query,
+            "variables": { "owner": owner, "repo": repo, "sha": head_sha }
+        });
+
+        let resp: Response = self
+            .octo
+            .graphql(&body)
+            .await
+            .with_context(|| format!("GraphQL checkRuns query for {owner}/{repo}@{head_sha}"))?;
+
+        let mut runs = Vec::new();
+        if let Some(data) = resp.data {
+            if let Some(repository) = data.repository {
+                if let Some(obj) = repository.object {
+                    if let Some(suites) = obj.check_suites {
+                        for suite in suites.nodes {
+                            if let Some(check_runs) = suite.check_runs {
+                                for run in check_runs.nodes {
+                                    runs.push(CheckRun {
+                                        name: run.name,
+                                        status: run.status,
+                                        conclusion: run.conclusion,
+                                        started_at: run.started_at,
+                                        completed_at: run.completed_at,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(runs)
     }
 }
 

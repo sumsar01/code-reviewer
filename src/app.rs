@@ -1,6 +1,6 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
-use crate::github::{DiffFile, GitHubClient, PullRequest, ReviewComment, parse_diff};
+use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, ReviewComment, parse_diff};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
     process::Command,
     sync::Arc,
@@ -52,13 +52,15 @@ pub enum LoadState {
 enum BgMsg {
     PrsLoaded(Vec<PullRequest>),
     PrsError(String),
-    ReviewDecisionsLoaded(HashMap<u64, String>),
+    ReviewDecisionsLoaded(PrMetadata),
     DiffLoaded(Vec<DiffFile>),
     DiffError(String),
     CommentsLoaded(Vec<ReviewComment>),
     CommentsError(String),
     DifftLoaded(Vec<(String, String)>),
     DifftError(String),
+    CheckRunsLoaded(Vec<CheckRun>),
+    CheckRunsError(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -97,6 +99,9 @@ pub struct App {
     pub difft_scroll: u16,
     pub difft_file_cursor: usize,
     pub difft_load_state: LoadState,
+
+    pub check_runs: Vec<CheckRun>,
+    pub check_runs_load_state: LoadState,
 
     tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -156,6 +161,8 @@ impl App {
             difft_scroll: 0,
             difft_file_cursor: 0,
             difft_load_state: LoadState::Idle,
+            check_runs: Vec::new(),
+            check_runs_load_state: LoadState::Idle,
             tx,
             rx,
         };
@@ -479,10 +486,13 @@ impl App {
             BgMsg::PrsError(e) => {
                 self.pr_load_state = LoadState::Error(e);
             }
-            BgMsg::ReviewDecisionsLoaded(decisions) => {
+            BgMsg::ReviewDecisionsLoaded(meta) => {
                 for pr in &mut self.prs {
-                    if let Some(decision) = decisions.get(&pr.number) {
+                    if let Some(decision) = meta.review_decisions.get(&pr.number) {
                         pr.review_decision = Some(decision.clone());
+                    }
+                    if let Some(ci_state) = meta.ci_statuses.get(&pr.number) {
+                        pr.ci_status = Some(ci_state.clone());
                     }
                 }
             }
@@ -512,6 +522,13 @@ impl App {
             BgMsg::DifftError(e) => {
                 self.difft_load_state = LoadState::Error(e);
             }
+            BgMsg::CheckRunsLoaded(runs) => {
+                self.check_runs = runs;
+                self.check_runs_load_state = LoadState::Idle;
+            }
+            BgMsg::CheckRunsError(e) => {
+                self.check_runs_load_state = LoadState::Error(e);
+            }
         }
     }
 
@@ -537,10 +554,10 @@ impl App {
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
-            match gh.fetch_review_decisions(&repo.owner, &repo.name).await {
-                Ok(decisions) => { let _ = tx.send(BgMsg::ReviewDecisionsLoaded(decisions)); }
-                Err(_) => {} // silently ignore — review decisions are best-effort
-            }
+                match gh.fetch_review_decisions(&repo.owner, &repo.name).await {
+                    Ok(meta) => { let _ = tx.send(BgMsg::ReviewDecisionsLoaded(meta)); }
+                    Err(_) => {} // silently ignore — review decisions are best-effort
+                }
         });
     }
 
@@ -569,6 +586,19 @@ impl App {
             match gh.pr_comments(&repo.owner, &repo.name, pr_number).await {
                 Ok(comments) => { let _ = tx.send(BgMsg::CommentsLoaded(comments)); }
                 Err(e) => { let _ = tx.send(BgMsg::CommentsError(format!("{:#}", e))); }
+            }
+        });
+    }
+
+    fn fetch_check_runs(&self, head_sha: String) {
+        let Some(repo) = self.repo.clone() else { return };
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            match gh.fetch_check_runs(&repo.owner, &repo.name, &head_sha).await {
+                Ok(runs) => { let _ = tx.send(BgMsg::CheckRunsLoaded(runs)); }
+                Err(e) => { let _ = tx.send(BgMsg::CheckRunsError(format!("{:#}", e))); }
             }
         });
     }
@@ -679,10 +709,13 @@ impl App {
         self.comments_load_state = LoadState::Loading;
         self.difft_files = Vec::new();
         self.difft_load_state = LoadState::Loading;
+        self.check_runs = Vec::new();
+        self.check_runs_load_state = LoadState::Loading;
 
         self.fetch_diff(pr_number);
         self.fetch_comments(pr_number);
-        self.fetch_difft(base_sha, head_sha);
+        self.fetch_difft(base_sha, head_sha.clone());
+        self.fetch_check_runs(head_sha);
     }
 
     /// Returns the set of file indices (into `diff_files`) that are marked reviewed
