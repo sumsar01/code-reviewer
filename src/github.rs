@@ -367,8 +367,9 @@ impl GitHubClient {
         Ok(PrMetadata { review_decisions, ci_statuses })
     }
 
-    /// Fetch individual CI check runs for a specific commit SHA.
-    /// Returns a flat list of check runs across all check suites.
+    /// Fetch CI check results for a specific commit SHA.
+    /// Uses `statusCheckRollup { contexts }` which returns both modern CheckRuns
+    /// (Aikido, GitHub Actions) and legacy StatusContexts (CircleCI) in one query.
     pub async fn fetch_check_runs(
         &self,
         owner: &str,
@@ -389,31 +390,33 @@ impl GitHubClient {
         }
         #[derive(Deserialize)]
         struct GitObject {
-            #[serde(rename = "checkSuites")]
-            check_suites: Option<CheckSuiteConnection>,
+            #[serde(rename = "statusCheckRollup")]
+            status_check_rollup: Option<StatusCheckRollup>,
         }
         #[derive(Deserialize)]
-        struct CheckSuiteConnection {
-            nodes: Vec<CheckSuiteNode>,
+        struct StatusCheckRollup {
+            contexts: ContextConnection,
         }
         #[derive(Deserialize)]
-        struct CheckSuiteNode {
-            #[serde(rename = "checkRuns")]
-            check_runs: Option<CheckRunConnection>,
+        struct ContextConnection {
+            nodes: Vec<ContextNode>,
         }
         #[derive(Deserialize)]
-        struct CheckRunConnection {
-            nodes: Vec<CheckRunNode>,
-        }
-        #[derive(Deserialize)]
-        struct CheckRunNode {
-            name: String,
-            status: String,
-            conclusion: Option<String>,
-            #[serde(rename = "startedAt")]
-            started_at: Option<String>,
-            #[serde(rename = "completedAt")]
-            completed_at: Option<String>,
+        #[serde(tag = "__typename")]
+        enum ContextNode {
+            CheckRun {
+                name: String,
+                status: String,
+                conclusion: Option<String>,
+                #[serde(rename = "startedAt")]
+                started_at: Option<String>,
+                #[serde(rename = "completedAt")]
+                completed_at: Option<String>,
+            },
+            StatusContext {
+                context: String,
+                state: String,
+            },
         }
 
         let query = r#"
@@ -421,15 +424,20 @@ impl GitHubClient {
               repository(owner: $owner, name: $repo) {
                 object(oid: $sha) {
                   ... on Commit {
-                    checkSuites(first: 20) {
-                      nodes {
-                        checkRuns(first: 50) {
-                          nodes {
+                    statusCheckRollup {
+                      contexts(first: 100) {
+                        nodes {
+                          __typename
+                          ... on CheckRun {
                             name
                             status
                             conclusion
                             startedAt
                             completedAt
+                          }
+                          ... on StatusContext {
+                            context
+                            state
                           }
                         }
                       }
@@ -449,30 +457,50 @@ impl GitHubClient {
             .octo
             .graphql(&body)
             .await
-            .with_context(|| format!("GraphQL checkRuns query for {owner}/{repo}@{head_sha}"))?;
+            .with_context(|| format!("GraphQL statusCheckRollup query for {owner}/{repo}@{head_sha}"))?;
 
         let mut runs = Vec::new();
         if let Some(data) = resp.data {
             if let Some(repository) = data.repository {
                 if let Some(obj) = repository.object {
-                    if let Some(suites) = obj.check_suites {
-                        for suite in suites.nodes {
-                            let suite_runs = suite
-                                .check_runs
-                                .map(|c| c.nodes)
-                                .unwrap_or_default();
-
-                            // Only show individual named runs — skip suites that
-                            // have no runs yet (e.g. perpetually-QUEUED external
-                            // systems like Spacelift/SonarQube that never fire).
-                            for run in suite_runs {
-                                runs.push(CheckRun {
-                                    name: run.name,
-                                    status: run.status,
-                                    conclusion: run.conclusion,
-                                    started_at: run.started_at,
-                                    completed_at: run.completed_at,
-                                });
+                    if let Some(rollup) = obj.status_check_rollup {
+                        for node in rollup.contexts.nodes {
+                            match node {
+                                ContextNode::CheckRun {
+                                    name,
+                                    status,
+                                    conclusion,
+                                    started_at,
+                                    completed_at,
+                                } => {
+                                    runs.push(CheckRun {
+                                        name,
+                                        status,
+                                        conclusion,
+                                        started_at,
+                                        completed_at,
+                                    });
+                                }
+                                ContextNode::StatusContext { context, state } => {
+                                    // Normalize legacy Status API state into CheckRun fields.
+                                    // Strip common "ci/circleci: " prefix for cleaner names.
+                                    let name = context
+                                        .strip_prefix("ci/circleci: ")
+                                        .unwrap_or(&context)
+                                        .to_string();
+                                    let (status, conclusion) = match state.to_uppercase().as_str() {
+                                        "SUCCESS" => ("COMPLETED".to_string(), Some("SUCCESS".to_string())),
+                                        "FAILURE" | "ERROR" => ("COMPLETED".to_string(), Some("FAILURE".to_string())),
+                                        _ => ("IN_PROGRESS".to_string(), None), // PENDING
+                                    };
+                                    runs.push(CheckRun {
+                                        name,
+                                        status,
+                                        conclusion,
+                                        started_at: None,
+                                        completed_at: None,
+                                    });
+                                }
                             }
                         }
                     }
