@@ -398,15 +398,8 @@ impl GitHubClient {
         }
         #[derive(Deserialize)]
         struct CheckSuiteNode {
-            app: Option<CheckSuiteApp>,
-            status: String,
-            conclusion: Option<String>,
             #[serde(rename = "checkRuns")]
             check_runs: Option<CheckRunConnection>,
-        }
-        #[derive(Deserialize)]
-        struct CheckSuiteApp {
-            name: String,
         }
         #[derive(Deserialize)]
         struct CheckRunConnection {
@@ -430,9 +423,6 @@ impl GitHubClient {
                   ... on Commit {
                     checkSuites(first: 20) {
                       nodes {
-                        app { name }
-                        status
-                        conclusion
                         checkRuns(first: 50) {
                           nodes {
                             name
@@ -472,30 +462,17 @@ impl GitHubClient {
                                 .map(|c| c.nodes)
                                 .unwrap_or_default();
 
-                            if suite_runs.is_empty() {
-                                // Suite has no individual runs yet (e.g. QUEUED) —
-                                // show one row for the suite itself.
-                                let name = suite
-                                    .app
-                                    .map(|a| a.name)
-                                    .unwrap_or_else(|| "unknown".to_string());
+                            // Only show individual named runs — skip suites that
+                            // have no runs yet (e.g. perpetually-QUEUED external
+                            // systems like Spacelift/SonarQube that never fire).
+                            for run in suite_runs {
                                 runs.push(CheckRun {
-                                    name,
-                                    status: suite.status,
-                                    conclusion: suite.conclusion,
-                                    started_at: None,
-                                    completed_at: None,
+                                    name: run.name,
+                                    status: run.status,
+                                    conclusion: run.conclusion,
+                                    started_at: run.started_at,
+                                    completed_at: run.completed_at,
                                 });
-                            } else {
-                                for run in suite_runs {
-                                    runs.push(CheckRun {
-                                        name: run.name,
-                                        status: run.status,
-                                        conclusion: run.conclusion,
-                                        started_at: run.started_at,
-                                        completed_at: run.completed_at,
-                                    });
-                                }
                             }
                         }
                     }
