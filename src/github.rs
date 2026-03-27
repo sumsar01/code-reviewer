@@ -394,8 +394,15 @@ impl GitHubClient {
         }
         #[derive(Deserialize)]
         struct CheckSuiteNode {
+            app: Option<CheckSuiteApp>,
+            status: String,
+            conclusion: Option<String>,
             #[serde(rename = "checkRuns")]
             check_runs: Option<CheckRunConnection>,
+        }
+        #[derive(Deserialize)]
+        struct CheckSuiteApp {
+            name: String,
         }
         #[derive(Deserialize)]
         struct CheckRunConnection {
@@ -419,6 +426,9 @@ impl GitHubClient {
                   ... on Commit {
                     checkSuites(first: 20) {
                       nodes {
+                        app { name }
+                        status
+                        conclusion
                         checkRuns(first: 50) {
                           nodes {
                             name
@@ -453,8 +463,27 @@ impl GitHubClient {
                 if let Some(obj) = repository.object {
                     if let Some(suites) = obj.check_suites {
                         for suite in suites.nodes {
-                            if let Some(check_runs) = suite.check_runs {
-                                for run in check_runs.nodes {
+                            let suite_runs = suite
+                                .check_runs
+                                .map(|c| c.nodes)
+                                .unwrap_or_default();
+
+                            if suite_runs.is_empty() {
+                                // Suite has no individual runs yet (e.g. QUEUED) —
+                                // show one row for the suite itself.
+                                let name = suite
+                                    .app
+                                    .map(|a| a.name)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                runs.push(CheckRun {
+                                    name,
+                                    status: suite.status,
+                                    conclusion: suite.conclusion,
+                                    started_at: None,
+                                    completed_at: None,
+                                });
+                            } else {
+                                for run in suite_runs {
                                     runs.push(CheckRun {
                                         name: run.name,
                                         status: run.status,
