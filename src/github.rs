@@ -111,10 +111,14 @@ impl GitHubClient {
                 return Ok(Self { octo, username });
             }
 
-            // Org match: check if repo_owner is an org this account belongs to
+            // Org match: check if the authenticated user is a member of the org
+            // by querying their own membership. Uses /user/memberships/orgs/{org}
+            // which returns 200 only when the token's user actually belongs to the org.
             let is_member = octo
-                .orgs(repo_owner)
-                .check_membership(&username)
+                .get::<serde_json::Value, _, _>(
+                    format!("/user/memberships/orgs/{repo_owner}"),
+                    None::<&()>,
+                )
                 .await
                 .is_ok();
 
