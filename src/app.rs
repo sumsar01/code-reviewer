@@ -3,7 +3,7 @@ use crate::git::{self, RepoInfo};
 use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, RepoSearchResult, ReviewComment, parse_diff};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
-use crate::ui::theme::{Theme, ALL_THEMES};
+use crate::ui::theme::Theme;
 use crate::updater;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -303,7 +303,7 @@ impl RepoSwitcherState {
 
 // ── Background task messages ──────────────────────────────────────────────────
 
-enum BgMsg {
+pub(crate) enum BgMsg {
     PrsLoaded(Vec<PullRequest>),
     PrsError(String),
     ReviewDecisionsLoaded(PrMetadata),
@@ -344,10 +344,10 @@ pub struct App {
     pub file_tree_cursor: usize,
     pub show_theme_picker: bool,
     pub theme_picker_cursor: usize,
-    pub theme_picker_original: Option<Theme>,
+    pub theme_picker_original: Option<Arc<Theme>>,
     pub config: Config,
-    pub theme: Theme,
-    pub syntax_hl: SyntaxHighlighter,
+    pub theme: Arc<Theme>,
+    pub syntax_hl: Arc<SyntaxHighlighter>,
 
     pub repo: Option<RepoInfo>,
     pub github: Arc<GitHubClient>,
@@ -396,7 +396,7 @@ pub struct App {
     /// Active repo-switcher overlay state (None when not shown).
     pub repo_switcher: Option<RepoSwitcherState>,
 
-    tx: mpsc::UnboundedSender<BgMsg>,
+    pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
 }
 
@@ -421,7 +421,7 @@ impl App {
         let owner_hint = repo.as_ref().map(|r| r.owner.as_str()).unwrap_or("");
         let github = Arc::new(GitHubClient::new_for_owner(owner_hint).await?);
 
-        let theme = Theme::from_name(&config.ui.theme);
+        let theme = Arc::new(Theme::from_name(&config.ui.theme));
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -436,7 +436,7 @@ impl App {
             theme_picker_cursor: Theme::index_of(&config.ui.theme),
             theme_picker_original: None,
             theme,
-            syntax_hl: SyntaxHighlighter::new(),
+            syntax_hl: Arc::new(SyntaxHighlighter::new()),
             config,
             repo,
             github,
@@ -560,47 +560,11 @@ impl App {
     }
 
     fn handle_key_review_overlay(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        // Ctrl+Enter submits; Esc cancels; everything else edits the buffer.
-        if mods.contains(KeyModifiers::CONTROL) {
-            match code {
-                // KeyCode::Enter requires the keyboard enhancement protocol (enabled in main.rs).
-                // On terminals without enhancement (e.g. macOS Terminal), Ctrl+Enter sends
-                // Ctrl+m (carriage return), so we handle both.
-                // KeyCode::Char('s') is an explicit Ctrl+S fallback shown in the hint bar.
-                KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char('s') => {
-                    self.submit_review_overlay();
-                    return false;
-                }
-                _ => {}
-            }
-        }
-
-        // Esc closes the overlay without needing a mutable borrow of its contents.
-        if code == KeyCode::Esc {
-            self.review_overlay = None;
-            return false;
-        }
-
-        // All remaining keys mutate the overlay buffer — bail early if there is none.
-        let Some(overlay) = self.review_overlay.as_mut() else {
-            return false;
-        };
-
-        match code {
-            KeyCode::Enter => overlay.insert_newline(),
-            KeyCode::Backspace => overlay.backspace(),
-            KeyCode::Left => overlay.move_left(),
-            KeyCode::Right => overlay.move_right(),
-            KeyCode::Up => overlay.move_up(),
-            KeyCode::Down => overlay.move_down(),
-            KeyCode::Char(ch) => overlay.insert_char(ch),
-            _ => {}
-        }
-        false
+        crate::input::overlay::handle_key_review_overlay(self, code, mods)
     }
 
     /// Validate and submit the current review overlay.
-    fn submit_review_overlay(&mut self) {
+    pub fn submit_review_overlay(&mut self) {
         let Some(overlay) = &mut self.review_overlay else { return };
 
         let body = overlay.body();
@@ -657,590 +621,23 @@ impl App {
     /// Returns `true` if the app should quit (it won't — we return false always
     /// here and let the app stay alive until the user relaunches after update).
     fn handle_key_update_prompt(&mut self, code: KeyCode) -> bool {
-        match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let tag = match self.update_available.clone() {
-                    Some(t) => t,
-                    None => return false,
-                };
-                self.update_in_progress = true;
-                let tx = self.tx.clone();
-                // Run the blocking `cargo install` on a dedicated thread so it
-                // doesn't stall the tokio executor.
-                tokio::task::spawn_blocking(move || {
-                    match crate::updater::perform_update(&tag) {
-                        Ok(()) => {
-                            let _ = tx.send(BgMsg::UpdateCompleted);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(BgMsg::UpdateFailed(e));
-                        }
-                    }
-                });
-                false
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.update_available = None;
-                false
-            }
-            _ => false,
-        }
+        crate::input::overlay::handle_key_update_prompt(self, code)
     }
 
-    fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {        match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.theme_picker_cursor + 1 < ALL_THEMES.len() {
-                    self.theme_picker_cursor += 1;
-                    self.theme = Theme::from_name(ALL_THEMES[self.theme_picker_cursor].0);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.theme_picker_cursor > 0 {
-                    self.theme_picker_cursor -= 1;
-                    self.theme = Theme::from_name(ALL_THEMES[self.theme_picker_cursor].0);
-                }
-            }
-            KeyCode::Enter => {
-                self.config.ui.theme = ALL_THEMES[self.theme_picker_cursor].0.to_string();
-                self.theme_picker_original = None;
-                self.show_theme_picker = false;
-            }
-            KeyCode::Esc => {
-                if let Some(original) = self.theme_picker_original.take() {
-                    self.theme = original;
-                }
-                self.show_theme_picker = false;
-            }
-            _ => {}
-        }
-        false
+    fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {
+        crate::input::overlay::handle_key_theme_picker(self, code)
     }
 
     fn handle_key_repo_switcher(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        // ── Ctrl+W — delete last word ────────────────────────────────────────
-        if mods.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char('w') = code {
-                if let Some(state) = self.repo_switcher.as_mut() {
-                    let q = &mut state.query;
-                    // Trim trailing spaces then pop until the previous word boundary
-                    // (space or '/') so `ctrl+w` over "rust-lang/rust" backs to "rust-lang/".
-                    while q.ends_with(' ') { q.pop(); }
-                    while !q.is_empty() && !q.ends_with('/') && !q.ends_with(' ') { q.pop(); }
-                    state.cursor = 0;
-                    state.results.clear();
-                    if q.is_empty() {
-                        state.search_state = SearchState::Idle;
-                    } else {
-                        state.search_state = SearchState::Loading;
-                        state.last_keystroke = Some(Instant::now());
-                    }
-                }
-                return false;
-            }
-        }
-
-        let Some(state) = self.repo_switcher.as_mut() else {
-            return false;
-        };
-
-        match code {
-            KeyCode::Esc => {
-                self.repo_switcher = None;
-            }
-            KeyCode::Enter => {
-                let query = self
-                    .repo_switcher
-                    .as_ref()
-                    .map(|s| s.query.trim().to_string())
-                    .unwrap_or_default();
-
-                // If the query looks like "owner/repo" already, switch directly
-                // without requiring a search result to be selected.
-                let target = if looks_like_full_name(&query) {
-                    Some(query)
-                } else {
-                    self.repo_switcher.as_ref().and_then(|s| s.selected_full_name())
-                };
-
-                if let Some(full_name) = target {
-                    self.repo_switcher = None;
-                    self.switch_repo(&full_name);
-                }
-            }
-            KeyCode::Tab => {
-                // Fill the input with the currently highlighted suggestion so
-                // the user can refine it before confirming.
-                if let Some(name) = state.selected_full_name() {
-                    state.query = name;
-                    state.cursor = 0;
-                    state.results.clear();
-                    state.search_state = SearchState::Loading;
-                    state.last_keystroke = Some(Instant::now());
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                let count = state.suggestion_count();
-                if count > 0 && state.cursor + 1 < count {
-                    state.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                state.cursor = state.cursor.saturating_sub(1);
-            }
-            KeyCode::Backspace => {
-                state.query.pop();
-                state.cursor = 0;
-                state.results.clear();
-                if state.query.is_empty() {
-                    state.search_state = SearchState::Idle;
-                } else {
-                    state.search_state = SearchState::Loading;
-                    state.last_keystroke = Some(Instant::now());
-                }
-            }
-            KeyCode::Char(ch) => {
-                state.query.push(ch);
-                state.cursor = 0;
-                state.search_state = SearchState::Loading;
-                state.last_keystroke = Some(Instant::now());
-            }
-            _ => {}
-        }
-        false
+        crate::input::overlay::handle_key_repo_switcher(self, code, mods)
     }
 
     fn handle_key_list(&mut self, code: KeyCode) -> bool {
-        match code {
-            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.prs.is_empty() {
-                    self.pr_cursor = (self.pr_cursor + 1).min(self.prs.len() - 1);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.pr_cursor = self.pr_cursor.saturating_sub(1);
-            }
-            KeyCode::Enter => {
-                if !self.prs.is_empty() {
-                    self.open_detail();
-                }
-            }
-            KeyCode::Char('a') => {
-                self.config.ui.show_all_prs = !self.config.ui.show_all_prs;
-                self.pr_cursor = 0;
-                self.pr_load_state = LoadState::Loading;
-                self.fetch_prs();
-            }
-            KeyCode::Char('r') => {
-                self.pr_cursor = 0;
-                self.pr_load_state = LoadState::Loading;
-                self.fetch_prs();
-            }
-            KeyCode::Char('o') => {
-                if let Some(pr) = self.prs.get(self.pr_cursor) {
-                    let _ = open::that(&pr.url);
-                }
-            }
-            KeyCode::Char('T') => {
-                self.theme_picker_original = Some(self.theme.clone());
-                self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
-                self.show_theme_picker = true;
-            }
-            KeyCode::Char('/') => {
-                let recent = self.config.ui.recent_repos.clone();
-                self.repo_switcher = Some(RepoSwitcherState::new(recent));
-            }
-            _ => {}
-        }
-        false
+        crate::input::list::handle_key_list(self, code)
     }
 
     fn handle_key_detail(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        // ── File-tree focus: intercept j/k/Enter/Esc ─────────────────────────
-        if self.detail_focus == DetailFocus::FileTree {
-            self.pending_count.clear();
-            self.g_pending = false;
-            return self.handle_key_file_tree(code);
-        }
-
-        // ── Count prefix accumulation (digits 0-9) ───────────────────────────
-        // '0' with an existing count prefix is a count digit; bare '0' is "scroll to column 0".
-        if let KeyCode::Char(c) = code {
-            if c.is_ascii_digit() && (c != '0' || !self.pending_count.is_empty()) {
-                self.pending_count.push(c);
-                self.g_pending = false;
-                return false;
-            }
-        }
-
-        // Consume the count (default 1) and clear the buffer.
-        let count: u16 = self.pending_count.parse().unwrap_or(1).max(1);
-        self.pending_count.clear();
-
-        // ── Ctrl-d / Ctrl-u (half-page) ──────────────────────────────────────
-        if mods.contains(KeyModifiers::CONTROL) {
-            let half = (self.last_diff_area_height / 2).max(1);
-            let step = half.saturating_mul(count);
-            match code {
-                KeyCode::Char('d') => {
-                    self.g_pending = false;
-                    match self.detail_tab {
-                        DetailTab::Diff => {
-                            let max = self.max_diff_scroll();
-                            self.diff_scroll = self.diff_scroll.saturating_add(step).min(max);
-                        }
-                        DetailTab::Comments => {
-                            let max = self.max_comments_scroll();
-                            self.comments_scroll = self.comments_scroll.saturating_add(step).min(max);
-                        }
-                        DetailTab::Difftastic => {
-                            let max = self.max_difft_scroll();
-                            self.difft_scroll = self.difft_scroll.saturating_add(step).min(max);
-                        }
-                    }
-                    return false;
-                }
-                KeyCode::Char('u') => {
-                    self.g_pending = false;
-                    match self.detail_tab {
-                        DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(step),
-                        DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(step),
-                        DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(step),
-                    }
-                    return false;
-                }
-                _ => {}
-            }
-        }
-
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.g_pending = false;
-                self.screen = Screen::PrList;
-                self.diff_scroll = 0;
-                self.diff_hscroll = 0;
-                self.comments_scroll = 0;
-                self.diff_file_cursor = 0;
-                self.diff_line_cursor = 0;
-            }
-            KeyCode::Char('?') => {
-                self.g_pending = false;
-                self.show_help = true;
-            }
-            // Space: toggle tree panel visibility
-            KeyCode::Char(' ') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff | DetailTab::Difftastic => {
-                        self.show_file_tree = !self.show_file_tree;
-                        if !self.show_file_tree {
-                            self.detail_focus = DetailFocus::Content;
-                        }
-                    }
-                    DetailTab::Comments => {} // tree not shown on Comments tab
-                }
-            }
-            KeyCode::Tab => {
-                self.g_pending = false;
-                if self.show_file_tree
-                    && matches!(self.detail_tab, DetailTab::Diff | DetailTab::Difftastic)
-                {
-                    // Cycle focus: Content → FileTree → Content
-                    self.detail_focus = match self.detail_focus {
-                        DetailFocus::Content => DetailFocus::FileTree,
-                        DetailFocus::FileTree => DetailFocus::Content,
-                    };
-                } else {
-                    // No tree visible: cycle tabs as before
-                    self.detail_tab = match self.detail_tab {
-                        DetailTab::Diff => DetailTab::Comments,
-                        DetailTab::Comments => DetailTab::Difftastic,
-                        DetailTab::Difftastic => DetailTab::Diff,
-                    };
-                }
-            }
-
-            // ── Vertical scroll: j / Down ────────────────────────────────────
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => {
-                        let max = self.max_diff_scroll();
-                        self.diff_scroll = self.diff_scroll.saturating_add(count).min(max);
-                        self.diff_line_cursor = self.diff_line_cursor.saturating_add(count as usize).min(max as usize);
-                    }
-                    DetailTab::Comments => {
-                        let max = self.max_comments_scroll();
-                        self.comments_scroll = self.comments_scroll.saturating_add(count).min(max);
-                    }
-                    DetailTab::Difftastic => {
-                        let max = self.max_difft_scroll();
-                        self.difft_scroll = self.difft_scroll.saturating_add(count).min(max);
-                    }
-                }
-            }
-
-            // ── Vertical scroll: k / Up ──────────────────────────────────────
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => {
-                        self.diff_scroll = self.diff_scroll.saturating_sub(count);
-                        self.diff_line_cursor = self.diff_line_cursor.saturating_sub(count as usize);
-                    }
-                    DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(count),
-                    DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(count),
-                }
-            }
-
-            // ── Horizontal scroll: h / Left / l / Right ──────────────────────
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => self.diff_hscroll = self.diff_hscroll.saturating_sub(count),
-                    DetailTab::Difftastic => self.difft_hscroll = self.difft_hscroll.saturating_sub(count),
-                    DetailTab::Comments => {}
-                }
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => self.diff_hscroll = self.diff_hscroll.saturating_add(count),
-                    DetailTab::Difftastic => self.difft_hscroll = self.difft_hscroll.saturating_add(count),
-                    DetailTab::Comments => {}
-                }
-            }
-
-            // ── G — jump to bottom ───────────────────────────────────────────
-            KeyCode::Char('G') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => {
-                        let max = self.max_diff_scroll();
-                        self.diff_scroll = max;
-                        self.diff_line_cursor = max as usize;
-                    }
-                    DetailTab::Comments => self.comments_scroll = self.max_comments_scroll(),
-                    DetailTab::Difftastic => self.difft_scroll = self.max_difft_scroll(),
-                }
-            }
-
-            // ── g — first press arms gg; second press jumps to top ───────────
-            KeyCode::Char('g') => {
-                if self.g_pending {
-                    // gg: jump to top
-                    self.g_pending = false;
-                    match self.detail_tab {
-                        DetailTab::Diff => {
-                            self.diff_scroll = 0;
-                            self.diff_line_cursor = 0;
-                        }
-                        DetailTab::Comments => self.comments_scroll = 0,
-                        DetailTab::Difftastic => self.difft_scroll = 0,
-                    }
-                } else {
-                    self.g_pending = true;
-                }
-            }
-
-            // ── 0 — scroll to leftmost column (bare zero, no count prefix) ───
-            KeyCode::Char('0') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => self.diff_hscroll = 0,
-                    DetailTab::Difftastic => self.difft_hscroll = 0,
-                    DetailTab::Comments => {}
-                }
-            }
-
-            // ── $ — scroll to far right (large sentinel value) ───────────────
-            KeyCode::Char('$') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Diff => self.diff_hscroll = u16::MAX,
-                    DetailTab::Difftastic => self.difft_hscroll = u16::MAX,
-                    DetailTab::Comments => {}
-                }
-            }
-
-            // ── File navigation: n / N ────────────────────────────────────────
-            KeyCode::Char('n') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Difftastic => {
-                        if !self.difft_files.is_empty() {
-                            self.difft_file_cursor =
-                                (self.difft_file_cursor + count as usize).min(self.difft_files.len() - 1);
-                            self.difft_scroll = 0;
-                        }
-                    }
-                    _ => {
-                        if !self.diff_files.is_empty() {
-                            self.diff_file_cursor =
-                                (self.diff_file_cursor + count as usize).min(self.diff_files.len() - 1);
-                            self.diff_scroll = 0;
-                            self.diff_line_cursor = 0;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('N') => {
-                self.g_pending = false;
-                match self.detail_tab {
-                    DetailTab::Difftastic => {
-                        self.difft_file_cursor = self.difft_file_cursor.saturating_sub(count as usize);
-                        self.difft_scroll = 0;
-                    }
-                    _ => {
-                        self.diff_file_cursor = self.diff_file_cursor.saturating_sub(count as usize);
-                        self.diff_scroll = 0;
-                        self.diff_line_cursor = 0;
-                    }
-                }
-            }
-
-            KeyCode::Char('o') => {
-                self.g_pending = false;
-                if let Some(pr) = self.prs.get(self.pr_cursor) {
-                    let _ = open::that(&pr.url);
-                }
-            }
-            KeyCode::Char('v') => {
-                self.g_pending = false;
-                self.toggle_reviewed();
-            }
-            KeyCode::Char('c') => {
-                self.g_pending = false;
-                self.checkout_pr_branch();
-            }
-            KeyCode::Char('T') => {
-                self.g_pending = false;
-                self.theme_picker_original = Some(self.theme.clone());
-                self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
-                self.show_theme_picker = true;
-            }
-            KeyCode::Char('A') => {
-                self.g_pending = false;
-                self.status_message = None;
-                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::Approve));
-            }
-            KeyCode::Char('R') => {
-                self.g_pending = false;
-                self.status_message = None;
-                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::RequestChanges));
-            }
-            KeyCode::Char('C') => {
-                self.g_pending = false;
-                self.status_message = None;
-                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::Comment));
-            }
-            // ── i — inline comment on the current diff line ──────────────────
-            KeyCode::Char('i') => {
-                self.g_pending = false;
-                if self.detail_tab == DetailTab::Diff {
-                    if let Some((path, diff_line)) = self.diff_line_at_cursor() {
-                        let (line, side) = match diff_line.kind {
-                            crate::github::DiffLineKind::Removed => {
-                                (diff_line.left_no.unwrap_or(1) as u64, "LEFT".to_string())
-                            }
-                            _ => {
-                                (diff_line.right_no.unwrap_or(1) as u64, "RIGHT".to_string())
-                            }
-                        };
-                        self.status_message = None;
-                        self.review_overlay = Some(ReviewOverlayState::new(
-                            ReviewAction::InlineComment { path, line, side },
-                        ));
-                    } else {
-                        self.status_message = Some((
-                            "Cursor is on a hunk header — move to a diff line first".to_string(),
-                            Instant::now(),
-                        ));
-                    }
-                }
-            }
-            // ── Enter — peek at existing comments on the cursor diff line ────
-            KeyCode::Enter => {
-                self.g_pending = false;
-                if self.detail_tab == DetailTab::Diff {
-                    if let Some(comments) = self.comments_at_cursor() {
-                        self.comment_peek = Some(comments);
-                    }
-                }
-            }
-            _ => {
-                // Any unrecognised key clears the g-pending state.
-                self.g_pending = false;
-            }
-        }
-        false
-    }
-
-    /// Key handler when the file-tree sidebar has focus.
-    fn handle_key_file_tree(&mut self, code: KeyCode) -> bool {
-        use crate::ui::file_tree;
-
-        // Build current rows so we can do index arithmetic.
-        let rows: Vec<file_tree::TreeRow> = match self.detail_tab {
-            DetailTab::Diff => {
-                let paths: Vec<String> =
-                    self.diff_files.iter().map(|f| f.filename.clone()).collect();
-                file_tree::build_rows(&paths)
-            }
-            DetailTab::Difftastic => {
-                let paths: Vec<String> =
-                    self.difft_files.iter().map(|(n, _)| n.clone()).collect();
-                file_tree::build_rows(&paths)
-            }
-            DetailTab::Comments => {
-                // Tree not shown on Comments; transfer focus back
-                self.detail_focus = DetailFocus::Content;
-                return false;
-            }
-        };
-
-        match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !rows.is_empty() {
-                    self.file_tree_cursor =
-                        (self.file_tree_cursor + 1).min(rows.len() - 1);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.file_tree_cursor = self.file_tree_cursor.saturating_sub(1);
-            }
-            KeyCode::Enter => {
-                // Jump to the file the cursor points at (skip directory rows)
-                if let Some(row) = rows.get(self.file_tree_cursor) {
-                    if let Some(file_idx) = row.file_index {
-                        match self.detail_tab {
-                            DetailTab::Diff => {
-                                self.diff_file_cursor = file_idx;
-                                self.diff_scroll = 0;
-                                self.diff_line_cursor = 0;
-                            }
-                            DetailTab::Difftastic => {
-                                self.difft_file_cursor = file_idx;
-                                self.difft_scroll = 0;
-                            }
-                            DetailTab::Comments => {}
-                        }
-                        // Move focus back to content after selecting
-                        self.detail_focus = DetailFocus::Content;
-                    }
-                }
-            }
-            KeyCode::Char(' ') | KeyCode::Esc => {
-                // Close tree / return focus to content
-                self.detail_focus = DetailFocus::Content;
-            }
-            KeyCode::Tab => {
-                self.detail_focus = DetailFocus::Content;
-            }
-            _ => {}
-        }
-        false
+        crate::input::detail::handle_key_detail(self, code, mods)
     }
 
     // ── Background message handler ────────────────────────────────────────────
@@ -1402,7 +799,7 @@ impl App {
 
     /// Switch the active repo to `full_name` ("owner/name"), re-authenticate if
     /// needed, persist to recent history, and trigger a fresh PR load.
-    fn switch_repo(&mut self, full_name: &str) {
+    pub fn switch_repo(&mut self, full_name: &str) {
         let mut parts = full_name.splitn(2, '/');
         let owner = match parts.next() {
             Some(o) if !o.is_empty() => o.to_string(),
@@ -1463,7 +860,7 @@ impl App {
         });
     }
 
-    fn fetch_prs(&self) {
+    pub fn fetch_prs(&self) {
         let Some(repo) = self.repo.clone() else { return };
         let gh = Arc::clone(&self.github);
         let tx = self.tx.clone();
@@ -1596,7 +993,7 @@ impl App {
     // ── Scroll helpers ────────────────────────────────────────────────────────
 
     /// Total rendered lines for the current diff file (each hunk header + each diff line).
-    fn max_diff_scroll(&self) -> u16 {
+    pub fn max_diff_scroll(&self) -> u16 {
         let idx = self.diff_file_cursor.min(self.diff_files.len().saturating_sub(1));
         let total: usize = self.diff_files.get(idx).map(|f| {
             f.hunks.iter().map(|h| 1 + h.lines.len()).sum()
@@ -1655,7 +1052,7 @@ impl App {
     }
 
     /// Total rendered lines for comments.
-    fn max_comments_scroll(&self) -> u16 {
+    pub fn max_comments_scroll(&self) -> u16 {
         // Each comment: 1 header line + body lines + 1 separator
         let total: usize = self.pr_comments.iter().map(|c| {
             1 + c.body.lines().count() + 1
@@ -1664,7 +1061,7 @@ impl App {
     }
 
     /// Total rendered lines for the current difftastic file output.
-    fn max_difft_scroll(&self) -> u16 {
+    pub fn max_difft_scroll(&self) -> u16 {
         let idx = self.difft_file_cursor.min(self.difft_files.len().saturating_sub(1));
         let total = self.difft_files.get(idx)
             .map(|(_, raw)| raw.lines().count())
@@ -1674,7 +1071,7 @@ impl App {
 
     // ── Actions ───────────────────────────────────────────────────────────────
 
-    fn open_detail(&mut self) {
+    pub fn open_detail(&mut self) {
         let Some(pr) = self.prs.get(self.pr_cursor) else { return };
         let pr_number = pr.number;
         let head_sha = pr.head_sha.clone();
@@ -1731,7 +1128,7 @@ impl App {
     }
 
     /// Toggle the current file's reviewed state and auto-advance to the next unreviewed file.
-    fn toggle_reviewed(&mut self) {
+    pub fn toggle_reviewed(&mut self) {
         let Some(repo) = &self.repo else { return };
         let Some(pr) = self.prs.get(self.pr_cursor) else { return };
         let pr_number = pr.number;
@@ -1789,7 +1186,7 @@ impl App {
         }
     }
 
-    fn checkout_pr_branch(&mut self) {
+    pub fn checkout_pr_branch(&mut self) {
         let Some(pr) = self.prs.get(self.pr_cursor) else { return };
         let branch = pr.head_branch.clone();
 
@@ -1814,7 +1211,7 @@ impl App {
 
 /// Returns `true` when `s` looks like a complete "owner/repo" slug:
 /// exactly one `/`, non-empty on both sides, no further slashes.
-fn looks_like_full_name(s: &str) -> bool {
+pub fn looks_like_full_name(s: &str) -> bool {
     let mut parts = s.splitn(3, '/');
     let owner = parts.next().unwrap_or("");
     let repo = parts.next().unwrap_or("");

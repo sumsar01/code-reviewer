@@ -1,6 +1,5 @@
 use crate::app::{App, DetailTab, LoadState};
 use crate::github::CheckRun;
-use crate::syntax::SyntaxHighlighter;
 use crate::ui::{
     comments, diff, difftastic,
     theme::Theme,
@@ -13,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
     Frame,
 };
+use std::sync::Arc;
 
 pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let pr = match app.prs.get(app.pr_cursor) {
@@ -53,17 +53,14 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     );
     render_tabs(f, app, chunks[1], t);
 
-    // Extract a reference to the syntax highlighter *before* the mutable borrow
-    // of `app` that happens inside diff::render.  We use a raw pointer to work
-    // around the borrow checker; this is safe because `syntax_hl` is not
-    // mutated by any code path below.
-    let hl_ptr: *const SyntaxHighlighter = &app.syntax_hl;
-    let hl: &SyntaxHighlighter = unsafe { &*hl_ptr };
+    // Clone the Arc (cheap reference-count bump) before the mutable borrow of
+    // `app` that happens inside diff::render / difftastic::render.
+    let hl = Arc::clone(&app.syntax_hl);
 
     match app.detail_tab {
-        DetailTab::Diff => diff::render(f, app, chunks[2], t, hl),
+        DetailTab::Diff => diff::render(f, app, chunks[2], t, &hl),
         DetailTab::Comments => comments::render(f, app, chunks[2], t),
-        DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t, hl),
+        DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t, &hl),
     }
 
     render_statusbar(f, app, chunks[3], t);

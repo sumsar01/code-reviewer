@@ -1,8 +1,8 @@
 mod app;
 mod config;
-mod error;
 mod git;
 mod github;
+mod input;
 mod syntax;
 mod ui;
 mod updater;
