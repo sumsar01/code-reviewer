@@ -1,5 +1,5 @@
 use crate::app::{App, ReviewAction};
-use crate::ui::theme::Theme;
+use crate::ui::{theme::Theme, utils::render_hint_bar};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,6 +7,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+
+/// Modal width as a percentage of the terminal width.
+const MODAL_WIDTH_PCT: u16 = 65;
+/// Modal height as a percentage of the terminal height.
+const MODAL_HEIGHT_PCT: u16 = 55;
+/// Minimum modal width in terminal columns.
+const MODAL_MIN_WIDTH: u16 = 50;
+/// Minimum modal height in terminal rows.
+const MODAL_MIN_HEIGHT: u16 = 12;
 
 /// Render the review-input overlay modal.
 pub fn render(f: &mut Frame, app: &App, t: &Theme) {
@@ -129,21 +138,7 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     let hints: &[(&str, &str)] = &[(submit_label, ""), ("Esc", "cancel"), ("Enter", "newline")];
 
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", t.text_dim_style()));
-        }
-        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
-        if !desc.is_empty() {
-            spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
-        }
-    }
-
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(t.background_style()),
-        chunks[3],
-    );
+    render_hint_bar(f, hints, chunks[3], t);
 }
 
 /// Pick an accent color based on the review action.
@@ -155,10 +150,14 @@ fn action_color(action: &ReviewAction, t: &Theme) -> Color {
     }
 }
 
-/// Compute a centered modal rect (65% width, limited height).
+/// Compute a centered modal rect (MODAL_WIDTH_PCT% width, MODAL_HEIGHT_PCT% height).
 fn modal_rect(r: Rect) -> Rect {
-    let width = (r.width * 65 / 100).max(50).min(r.width);
-    let height = (r.height * 55 / 100).max(12).min(r.height);
+    let width = (r.width * MODAL_WIDTH_PCT / 100)
+        .max(MODAL_MIN_WIDTH)
+        .min(r.width);
+    let height = (r.height * MODAL_HEIGHT_PCT / 100)
+        .max(MODAL_MIN_HEIGHT)
+        .min(r.height);
 
     let vert = Layout::default()
         .direction(Direction::Vertical)

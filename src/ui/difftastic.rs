@@ -1,6 +1,6 @@
 use crate::app::{App, DetailFocus, LoadState};
 use crate::syntax::{HlSpan, SyntaxHighlighter};
-use crate::ui::{file_tree, theme::Theme};
+use crate::ui::{constants::TREE_WIDTH, file_tree, theme::Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -8,9 +8,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-
-/// Width of the file-tree sidebar in columns.
-const TREE_WIDTH: u16 = 36;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHighlighter) {
     match &app.difft_load_state {
@@ -194,6 +191,28 @@ fn parse_ansi_spans(input: &str) -> Vec<ratatui::text::Span<'static>> {
 fn apply_sgr_codes(mut style: ratatui::style::Style, codes_str: &str) -> ratatui::style::Style {
     use ratatui::style::{Color, Modifier};
 
+    /// Apply an extended color from the `38` (foreground) or `48` (background)
+    /// SGR sequence.  Advances `idx` past the consumed sub-codes and returns
+    /// the applied color (or `None` if the sub-sequence is malformed).
+    fn parse_extended_color(codes: &[&str], idx: usize) -> Option<(Color, usize)> {
+        if idx + 1 >= codes.len() {
+            return None;
+        }
+        match codes[idx + 1] {
+            "5" if idx + 2 < codes.len() => {
+                let n: u8 = codes[idx + 2].parse().unwrap_or(0);
+                Some((Color::Indexed(n), idx + 2))
+            }
+            "2" if idx + 4 < codes.len() => {
+                let r: u8 = codes[idx + 2].parse().unwrap_or(0);
+                let g: u8 = codes[idx + 3].parse().unwrap_or(0);
+                let b: u8 = codes[idx + 4].parse().unwrap_or(0);
+                Some((Color::Rgb(r, g, b), idx + 4))
+            }
+            _ => None,
+        }
+    }
+
     let codes: Vec<&str> = codes_str.split(';').collect();
     let mut idx = 0;
 
@@ -237,41 +256,15 @@ fn apply_sgr_codes(mut style: ratatui::style::Style, codes_str: &str) -> ratatui
             96 => style = style.fg(Color::LightCyan),
             97 => style = style.fg(Color::Gray),
             38 => {
-                if idx + 1 < codes.len() {
-                    match codes[idx + 1] {
-                        "5" if idx + 2 < codes.len() => {
-                            let n: u8 = codes[idx + 2].parse().unwrap_or(0);
-                            style = style.fg(Color::Indexed(n));
-                            idx += 2;
-                        }
-                        "2" if idx + 4 < codes.len() => {
-                            let r: u8 = codes[idx + 2].parse().unwrap_or(0);
-                            let g: u8 = codes[idx + 3].parse().unwrap_or(0);
-                            let b: u8 = codes[idx + 4].parse().unwrap_or(0);
-                            style = style.fg(Color::Rgb(r, g, b));
-                            idx += 4;
-                        }
-                        _ => {}
-                    }
+                if let Some((color, new_idx)) = parse_extended_color(&codes, idx) {
+                    style = style.fg(color);
+                    idx = new_idx;
                 }
             }
             48 => {
-                if idx + 1 < codes.len() {
-                    match codes[idx + 1] {
-                        "5" if idx + 2 < codes.len() => {
-                            let n: u8 = codes[idx + 2].parse().unwrap_or(0);
-                            style = style.bg(Color::Indexed(n));
-                            idx += 2;
-                        }
-                        "2" if idx + 4 < codes.len() => {
-                            let r: u8 = codes[idx + 2].parse().unwrap_or(0);
-                            let g: u8 = codes[idx + 3].parse().unwrap_or(0);
-                            let b: u8 = codes[idx + 4].parse().unwrap_or(0);
-                            style = style.bg(Color::Rgb(r, g, b));
-                            idx += 4;
-                        }
-                        _ => {}
-                    }
+                if let Some((color, new_idx)) = parse_extended_color(&codes, idx) {
+                    style = style.bg(color);
+                    idx = new_idx;
                 }
             }
             _ => {}
@@ -471,6 +464,51 @@ fn parse_raw_spans(line: &str) -> Vec<RawSpan> {
     spans
 }
 
+/// Process one display-line side within `reconstruct_sources`.
+///
+/// * `linenum`      — the parsed line-number label (e.g. `"5"`, `"."`, or `None`)
+/// * `content`      — the trimmed text content for this side
+/// * `source_lines` — the accumulated source-file lines for this side (mutated)
+/// * `byte_offset`  — running byte offset within the current source line (mutated)
+///
+/// Returns `(src_line_index, byte_offset_for_this_display_row)`.
+fn process_side(
+    linenum: Option<&str>,
+    content: &str,
+    source_lines: &mut Vec<String>,
+    byte_offset: &mut usize,
+) -> (Option<usize>, usize) {
+    match linenum {
+        Some(".") => {
+            if !content.is_empty() {
+                // Continuation: append to the last source line.
+                if let Some(last) = source_lines.last_mut() {
+                    let offset = *byte_offset;
+                    last.push_str(content);
+                    *byte_offset += content.len();
+                    (Some(source_lines.len() - 1), offset)
+                } else {
+                    (None, 0)
+                }
+            } else {
+                // Pure placeholder — no content on this side.
+                *byte_offset = 0; // next real line starts fresh
+                (None, 0)
+            }
+        }
+        Some(num) if num.chars().all(|c| c.is_ascii_digit()) => {
+            // New source line.
+            source_lines.push(content.to_string());
+            *byte_offset = content.len();
+            (Some(source_lines.len() - 1), 0)
+        }
+        _ => {
+            // No label (e.g. header line).
+            (None, 0)
+        }
+    }
+}
+
 /// Reconstruct the old-file and new-file source strings from a block of
 /// difftastic side-by-side ANSI output, and return per-display-line metadata
 /// that maps each display row back to a position in the reconstructed sources.
@@ -531,93 +569,18 @@ fn reconstruct_sources(
         // Strip that trailing whitespace so the reconstructed source is clean.
         let left_content = left_content.trim_end().to_string();
 
-        // Determine this display row's relationship to the source lines.
-        //
-        // A `.` label means:
-        //   LEFT `.`  → either (a) no old-file content for this row (pure addition),
-        //                       or (b) continuation of the previous old-file source line.
-        //   RIGHT `.` → same logic for new-file.
-        //
-        // We distinguish (a) from (b) by whether the OTHER side also has a `.` label:
-        //   Both `.` → continuation of the LAST source line for the side that has
-        //              non-empty content.  (difft wraps the side that has content.)
-        //   One side has a real number, other is `.` → pure insertion/deletion.
-
-        // --- LEFT side ---
-        let left_src_line: Option<usize>;
-        let left_byte_offset: usize;
-
-        match left_linenum {
-            Some(".") => {
-                // Either a placeholder (pure addition) or a continuation.
-                // It's a continuation when LEFT has non-empty content on this row.
-                if !left_content.is_empty() {
-                    // Continuation: append to the last old-source line.
-                    if let Some(last) = old_lines.last_mut() {
-                        let offset = old_current_byte_offset;
-                        last.push_str(&left_content);
-                        old_current_byte_offset += left_content.len();
-                        left_src_line = Some(old_lines.len() - 1);
-                        left_byte_offset = offset;
-                    } else {
-                        left_src_line = None;
-                        left_byte_offset = 0;
-                    }
-                } else {
-                    // Pure placeholder — no old-file content here.
-                    left_src_line = None;
-                    left_byte_offset = 0;
-                    old_current_byte_offset = 0; // reset (next real left line is fresh)
-                }
-            }
-            Some(num) if num.chars().all(|c| c.is_ascii_digit()) => {
-                // New source line.
-                old_lines.push(left_content.clone());
-                left_src_line = Some(old_lines.len() - 1);
-                left_byte_offset = 0;
-                old_current_byte_offset = left_content.len();
-            }
-            _ => {
-                // No left-side label at all (e.g. header line).
-                left_src_line = None;
-                left_byte_offset = 0;
-            }
-        }
-
-        // --- RIGHT side ---
-        let right_src_line: Option<usize>;
-        let right_byte_offset: usize;
-
-        match right_linenum {
-            Some(".") => {
-                if !right_content.is_empty() {
-                    if let Some(last) = new_lines.last_mut() {
-                        let offset = new_current_byte_offset;
-                        last.push_str(&right_content);
-                        new_current_byte_offset += right_content.len();
-                        right_src_line = Some(new_lines.len() - 1);
-                        right_byte_offset = offset;
-                    } else {
-                        right_src_line = None;
-                        right_byte_offset = 0;
-                    }
-                } else {
-                    right_src_line = None;
-                    right_byte_offset = 0;
-                    new_current_byte_offset = 0;
-                }
-            }
-            Some(num) if num.chars().all(|c| c.is_ascii_digit()) => {
-                new_lines.push(right_content.clone());
-                right_src_line = Some(new_lines.len() - 1);
-                right_byte_offset = 0;
-                new_current_byte_offset = right_content.len();
-            }
-            _ => {
-                right_src_line = None;
-                right_byte_offset = 0;
-            }
-        }
+        let (left_src_line, left_byte_offset) = process_side(
+            left_linenum,
+            &left_content,
+            &mut old_lines,
+            &mut old_current_byte_offset,
+        );
+        let (right_src_line, right_byte_offset) = process_side(
+            right_linenum,
+            &right_content,
+            &mut new_lines,
+            &mut new_current_byte_offset,
+        );
 
         display_infos.push(DisplayLineInfo {
             left_src_line,

@@ -1,5 +1,8 @@
 use crate::app::{App, LoadState};
-use crate::ui::theme::Theme;
+use crate::ui::{
+    theme::Theme,
+    utils::{render_hint_bar, review_badge},
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,6 +10,25 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
+
+// ── PR list column layout constants ──────────────────────────────────────────
+
+/// Width of the PR number column (` #NNNNN`).
+const COL_NUMBER_WIDTH: usize = 7;
+/// Separator between number and title.
+const COL_SEP1_WIDTH: usize = 1;
+/// Indent before author name.
+const COL_INDENT_WIDTH: usize = 2;
+/// Width of the author name column.
+const COL_AUTHOR_WIDTH: usize = 20;
+/// Separator between author and stats.
+const COL_SEP2_WIDTH: usize = 2;
+/// Width of the `[DRAFT]` label when shown.
+const COL_DRAFT_WIDTH: usize = 8;
+/// Longest CI status badge (e.g. `"  ◌ PENDING"` = 11 chars).
+const CI_COL_WIDTH: usize = 11;
+/// Longest review decision badge (e.g. `"  ✓ APPROVED"` = 12 chars).
+const REVIEW_COL_WIDTH: usize = 12;
 
 /// Truncate a string to `max_chars`, appending `…` if truncated.
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -18,16 +40,6 @@ fn truncate(s: &str, max_chars: usize) -> String {
             .iter()
             .collect::<String>()
             + "…"
-    }
-}
-
-/// Return a short badge text and color for a review decision string.
-fn review_badge(decision: &str) -> (&'static str, Color) {
-    match decision {
-        "APPROVED" => ("✓ APPROVED", Color::Green),
-        "CHANGES_REQUESTED" => ("✗ CHANGES", Color::Red),
-        "REVIEW_REQUIRED" => ("? REVIEW", Color::Yellow),
-        _ => ("? REVIEW", Color::Yellow),
     }
 }
 
@@ -200,7 +212,7 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             };
 
             let number = format!(" #{:<5}", pr.number);
-            let author = format!("{:<20}", pr.author);
+            let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
             let additions = pr.additions.map(|v| format!("+{v}")).unwrap_or_default();
             let deletions = pr.deletions.map(|v| format!("-{v}")).unwrap_or_default();
             let total = match (pr.additions, pr.deletions) {
@@ -209,21 +221,14 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             };
             let stats = format!("{:>6} {:>6} {:>7}", additions, deletions, total);
 
-            // Fixed column widths for badge columns — constant regardless of whether
-            // data is present, so all rows align at the same horizontal positions.
-            // Longest CI badge:     "  ◌ PENDING"  = 11 chars
-            // Longest review badge: "  ✓ APPROVED" = 12 chars
-            const CI_COL_WIDTH: usize = 11;
-            const REVIEW_COL_WIDTH: usize = 12;
-
             let inner_width = area.width.saturating_sub(2) as usize;
-            let fixed = 7
-                + 1
-                + 2
-                + 20
-                + 2
+            let fixed = COL_NUMBER_WIDTH
+                + COL_SEP1_WIDTH
+                + COL_INDENT_WIDTH
+                + COL_AUTHOR_WIDTH
+                + COL_SEP2_WIDTH
                 + stats.len()
-                + if pr.draft { 8 } else { 0 }
+                + if pr.draft { COL_DRAFT_WIDTH } else { 0 }
                 + CI_COL_WIDTH
                 + REVIEW_COL_WIDTH;
             let title_width = inner_width.saturating_sub(fixed);
@@ -291,6 +296,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
     let hints: &[(&str, &str)] = &[
         ("j/k", "navigate"),
         ("Enter", "open"),
+        ("/", "search repo"),
         ("a", "toggle mine/all"),
         ("r", "refresh"),
         ("o", "browser"),
@@ -298,16 +304,5 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("?", "help"),
         ("q", "quit"),
     ];
-
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", t.text_dim_style()));
-        }
-        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
-        spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
-    }
-
-    let p = Paragraph::new(Line::from(spans)).style(t.background_style());
-    f.render_widget(p, area);
+    render_hint_bar(f, hints, area, t);
 }

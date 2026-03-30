@@ -49,6 +49,9 @@ pub struct UiConfig {
     /// Name of the color theme to use. Defaults to "tokyonight".
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Recently visited repos (owner/name), most recent first. Capped at 10.
+    #[serde(default)]
+    pub recent_repos: Vec<String>,
 }
 
 fn default_theme() -> String {
@@ -61,7 +64,19 @@ impl Default for UiConfig {
             last_repo: None,
             show_all_prs: false,
             theme: default_theme(),
+            recent_repos: Vec::new(),
         }
+    }
+}
+
+impl UiConfig {
+    /// Prepend `repo` (as "owner/name") to `recent_repos`, deduplicating and
+    /// capping the list at 10 entries.
+    pub fn push_recent_repo(&mut self, owner: &str, name: &str) {
+        let full = format!("{owner}/{name}");
+        self.recent_repos.retain(|r| r != &full);
+        self.recent_repos.insert(0, full);
+        self.recent_repos.truncate(10);
     }
 }
 

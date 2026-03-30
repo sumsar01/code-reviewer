@@ -1,7 +1,11 @@
 use crate::app::{App, DetailTab, LoadState};
 use crate::github::CheckRun;
 use crate::syntax::SyntaxHighlighter;
-use crate::ui::{comments, diff, difftastic, theme::Theme};
+use crate::ui::{
+    comments, diff, difftastic,
+    theme::Theme,
+    utils::{render_hint_bar, review_badge},
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -9,16 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
     Frame,
 };
-
-/// Return badge text and color for a review decision string.
-fn review_badge(decision: &str) -> (&'static str, Color) {
-    match decision {
-        "APPROVED" => ("✓ APPROVED", Color::Green),
-        "CHANGES_REQUESTED" => ("✗ CHANGES REQUESTED", Color::Red),
-        "REVIEW_REQUIRED" => ("? REVIEW REQUIRED", Color::Yellow),
-        _ => ("? REVIEW REQUIRED", Color::Yellow),
-    }
-}
 
 pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let pr = match app.prs.get(app.pr_cursor) {
@@ -174,36 +168,9 @@ fn render_pr_header(
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(bottom_area);
 
-        // Left col: reviewed progress + review decision
-        let mut left_lines: Vec<Line> = Vec::new();
-        if total > 0 {
-            let progress_color = if reviewed == total {
-                Color::Green
-            } else {
-                t.text_dim
-            };
-            left_lines.push(Line::from(vec![
-                Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
-                Span::styled(
-                    format!("{reviewed} / {total} files"),
-                    Style::default()
-                        .fg(progress_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-        if let Some(decision) = pr.review_decision.as_deref() {
-            let (text, color) = review_badge(decision);
-            left_lines.push(Line::from(vec![
-                Span::styled("Review: ", Style::default().fg(t.text_dim)),
-                Span::styled(
-                    text,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
         f.render_widget(
-            Paragraph::new(left_lines).style(t.background_style()),
+            Paragraph::new(reviewed_decision_lines(pr, reviewed, total, t))
+                .style(t.background_style()),
             cols[0],
         );
 
@@ -255,35 +222,9 @@ fn render_pr_header(
         );
     } else {
         // No CI data at all — single column for reviewed/decision only.
-        let mut left_lines: Vec<Line> = Vec::new();
-        if total > 0 {
-            let progress_color = if reviewed == total {
-                Color::Green
-            } else {
-                t.text_dim
-            };
-            left_lines.push(Line::from(vec![
-                Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
-                Span::styled(
-                    format!("{reviewed} / {total} files"),
-                    Style::default()
-                        .fg(progress_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-        if let Some(decision) = pr.review_decision.as_deref() {
-            let (text, color) = review_badge(decision);
-            left_lines.push(Line::from(vec![
-                Span::styled("Review: ", Style::default().fg(t.text_dim)),
-                Span::styled(
-                    text,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
         f.render_widget(
-            Paragraph::new(left_lines).style(t.background_style()),
+            Paragraph::new(reviewed_decision_lines(pr, reviewed, total, t))
+                .style(t.background_style()),
             bottom_area,
         );
     }
@@ -303,26 +244,94 @@ fn check_run_icon(run: &CheckRun) -> (&'static str, Color) {
     }
 }
 
+/// Build the left-column lines: reviewed-progress (if any) + review decision (if any).
+fn reviewed_decision_lines<'a>(
+    pr: &crate::github::PullRequest,
+    reviewed: usize,
+    total: usize,
+    t: &'a Theme,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+    if total > 0 {
+        let progress_color = if reviewed == total {
+            ratatui::style::Color::Green
+        } else {
+            t.text_dim
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Reviewed: ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("{reviewed} / {total} files"),
+                Style::default()
+                    .fg(progress_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    if let Some(decision) = pr.review_decision.as_deref() {
+        let (text, color) = review_badge(decision);
+        lines.push(Line::from(vec![
+            Span::styled("Review: ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines
+}
+
 /// Compute "Xm Ys" duration from ISO-8601 strings, or "—" if unavailable.
+///
+/// Parses the full date+time so cross-midnight runs are handled correctly.
+/// Expected format: "2024-01-15T10:23:45Z" (fractional seconds are stripped).
 fn format_duration(started: Option<&str>, completed: Option<&str>) -> String {
     let (Some(s), Some(c)) = (started, completed) else {
         return "—".to_string();
     };
-    // Parse only the time portion for a quick heuristic — we just need seconds.
-    // Full ISO-8601: "2024-01-15T10:23:45Z"
-    let parse_secs = |ts: &str| -> Option<i64> {
-        // Use a naive parse: split on 'T', then parse HH:MM:SS
-        let time_part = ts.split('T').nth(1)?;
+
+    /// Parse an ISO-8601 timestamp into total seconds since the Unix epoch
+    /// (date portion * 86400 + time-of-day seconds).  We use a simple
+    /// Gregorian day-count so we avoid pulling in `chrono` for this one helper.
+    fn parse_epoch_secs(ts: &str) -> Option<i64> {
+        // Split on 'T': ["2024-01-15", "10:23:45Z"]
+        let mut parts = ts.split('T');
+        let date_part = parts.next()?;
+        let time_part = parts.next()?;
+
+        let mut date_fields = date_part.split('-');
+        let year: i64 = date_fields.next()?.parse().ok()?;
+        let month: i64 = date_fields.next()?.parse().ok()?;
+        let day: i64 = date_fields.next()?.parse().ok()?;
+
         let hms: Vec<&str> = time_part.trim_end_matches('Z').split(':').collect();
         if hms.len() < 3 {
             return None;
         }
         let h: i64 = hms[0].parse().ok()?;
         let m: i64 = hms[1].parse().ok()?;
-        let s: i64 = hms[2].split('.').next()?.parse().ok()?;
-        Some(h * 3600 + m * 60 + s)
-    };
-    if let (Some(s_secs), Some(c_secs)) = (parse_secs(s), parse_secs(c)) {
+        let sec: i64 = hms[2].split('.').next()?.parse().ok()?;
+
+        // Days since epoch via a simple Gregorian formula (no leap-second handling needed).
+        // Algorithm: count days in years 1970..year, plus days in months, plus day-1.
+        let y = year;
+        let mo = month;
+        let d = day;
+        let leap = |yr: i64| (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0;
+        let days_in_month = [0i64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut days: i64 = (1970..y).map(|yr| if leap(yr) { 366 } else { 365 }).sum();
+        for mi in 1..mo {
+            days += days_in_month[mi as usize];
+            if mi == 2 && leap(y) {
+                days += 1;
+            }
+        }
+        days += d - 1;
+
+        Some(days * 86400 + h * 3600 + m * 60 + sec)
+    }
+
+    if let (Some(s_secs), Some(c_secs)) = (parse_epoch_secs(s), parse_epoch_secs(c)) {
         let elapsed = (c_secs - s_secs).abs();
         let mins = elapsed / 60;
         let secs = elapsed % 60;
@@ -409,15 +418,5 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ("?", "help"),
     ];
 
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", t.text_dim_style()));
-        }
-        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
-        spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
-    }
-
-    let p = Paragraph::new(Line::from(spans)).style(t.background_style());
-    f.render_widget(p, area);
+    render_hint_bar(f, hints, area, t);
 }
