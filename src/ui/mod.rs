@@ -1,3 +1,4 @@
+pub mod comment_peek;
 pub mod comments;
 pub mod diff;
 pub mod difftastic;
@@ -30,5 +31,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.review_overlay.is_some() {
         review_input::render(f, app, &t);
+    }
+
+    if app.comment_peek.is_some() {
+        comment_peek::render(f, app, &t);
     }
 }

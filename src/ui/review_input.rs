@@ -31,7 +31,13 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     // ── Outer block ──────────────────────────────────────────────────────────
     let accent = action_color(&overlay.action, t);
-    let title = format!(" {} ", overlay.action.title());
+    let title = match &overlay.action {
+        ReviewAction::InlineComment { path, line, side } => {
+            let side_label = if side == "LEFT" { "old" } else { "new" };
+            format!(" Inline Comment  {}:{} ({}) ", path, line, side_label)
+        }
+        _ => format!(" {} ", overlay.action.title()),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
@@ -114,12 +120,11 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
     }
 
     // ── Key hint bar ──────────────────────────────────────────────────────────
-    let submit_label = if overlay.action == ReviewAction::Approve {
-        "Ctrl+Enter  Approve"
-    } else if overlay.action == ReviewAction::RequestChanges {
-        "Ctrl+Enter  Request Changes"
-    } else {
-        "Ctrl+Enter  Submit Comment"
+    let submit_label = match &overlay.action {
+        ReviewAction::Approve => "Ctrl+Enter / Ctrl+S  Approve",
+        ReviewAction::RequestChanges => "Ctrl+Enter / Ctrl+S  Request Changes",
+        ReviewAction::InlineComment { .. } => "Ctrl+Enter / Ctrl+S  Post Comment",
+        _ => "Ctrl+Enter / Ctrl+S  Submit Comment",
     };
 
     let hints: &[(&str, &str)] = &[(submit_label, ""), ("Esc", "cancel"), ("Enter", "newline")];
@@ -146,7 +151,7 @@ fn action_color(action: &ReviewAction, t: &Theme) -> Color {
     match action {
         ReviewAction::Approve => Color::Green,
         ReviewAction::RequestChanges => Color::Red,
-        ReviewAction::Comment => t.text_accent,
+        ReviewAction::Comment | ReviewAction::InlineComment { .. } => t.text_accent,
     }
 }
 
