@@ -3,7 +3,7 @@ use crate::ui::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
@@ -28,6 +28,17 @@ fn review_badge(decision: &str) -> (&'static str, Color) {
         "CHANGES_REQUESTED" => ("✗ CHANGES", Color::Red),
         "REVIEW_REQUIRED" => ("? REVIEW", Color::Yellow),
         _ => ("? REVIEW", Color::Yellow),
+    }
+}
+
+/// Return a short badge text and color for a CI status rollup state.
+fn ci_badge(state: &str) -> (&'static str, Color) {
+    match state {
+        "SUCCESS" => ("● PASS", Color::Green),
+        "FAILURE" => ("✗ FAIL", Color::Red),
+        "ERROR" => ("✗ ERROR", Color::Red),
+        "PENDING" => ("◌ PENDING", Color::Yellow),
+        _ => ("◌ PENDING", Color::Yellow),
     }
 }
 
@@ -88,26 +99,37 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
 }
 
 fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .style(t.background_style());
+
     match &app.pr_load_state {
         LoadState::Loading => {
             let p = Paragraph::new("  Loading pull requests…")
                 .style(t.text_dim_style())
-                .block(
-                    Block::default()
-                        .borders(Borders::NONE)
-                        .style(t.background_style()),
-                );
+                .block(block);
             f.render_widget(p, area);
             return;
         }
         LoadState::Error(e) => {
-            let p = Paragraph::new(format!("  Error: {e}"))
-                .style(Style::default().fg(t.diff_removed_fg))
-                .block(
-                    Block::default()
-                        .borders(Borders::NONE)
-                        .style(t.background_style()),
-                );
+            let error_detail = e.clone();
+            let text = Text::from(vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Could not load pull requests",
+                        Style::default()
+                            .fg(t.diff_removed_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(error_detail, t.text_dim_style()),
+                ]),
+            ]);
+            let p = Paragraph::new(text).block(block);
             f.render_widget(p, area);
             return;
         }
@@ -115,16 +137,52 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     }
 
     if app.prs.is_empty() {
-        let msg = if app.config.ui.show_all_prs {
-            "  No open PRs for this repository."
+        let repo = app
+            .repo
+            .as_ref()
+            .map(|r| r.full_name())
+            .unwrap_or_else(|| "this repository".to_string());
+
+        let text = if app.config.ui.show_all_prs {
+            Text::from(vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("No open pull requests in {repo}"),
+                        Style::default()
+                            .fg(t.text_accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Press 'r' to refresh", t.text_dim_style()),
+                ]),
+            ])
         } else {
-            "  No open PRs from you. Press 'a' to show all."
+            Text::from(vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("No open pull requests from you in {repo}"),
+                        Style::default()
+                            .fg(t.text_accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Press 'a' to show all pull requests, or 'r' to refresh",
+                        t.text_dim_style(),
+                    ),
+                ]),
+            ])
         };
-        let p = Paragraph::new(msg).style(t.text_dim_style()).block(
-            Block::default()
-                .borders(Borders::NONE)
-                .style(t.background_style()),
-        );
+
+        let p = Paragraph::new(text).block(block);
         f.render_widget(p, area);
         return;
     }
@@ -151,19 +209,23 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             };
             let stats = format!("{:>6} {:>6} {:>7}", additions, deletions, total);
 
-            // Badge text for review decision (empty string when none)
-            let badge_text = pr
-                .review_decision
-                .as_deref()
-                .map(|d| {
-                    let (text, _) = review_badge(d);
-                    format!("  {text}")
-                })
-                .unwrap_or_default();
+            // Fixed column widths for badge columns — constant regardless of whether
+            // data is present, so all rows align at the same horizontal positions.
+            // Longest CI badge:     "  ◌ PENDING"  = 11 chars
+            // Longest review badge: "  ✓ APPROVED" = 12 chars
+            const CI_COL_WIDTH: usize = 11;
+            const REVIEW_COL_WIDTH: usize = 12;
 
             let inner_width = area.width.saturating_sub(2) as usize;
-            let fixed =
-                7 + 1 + 2 + 20 + 2 + stats.len() + if pr.draft { 8 } else { 0 } + badge_text.len();
+            let fixed = 7
+                + 1
+                + 2
+                + 20
+                + 2
+                + stats.len()
+                + if pr.draft { 8 } else { 0 }
+                + CI_COL_WIDTH
+                + REVIEW_COL_WIDTH;
             let title_width = inner_width.saturating_sub(fixed);
             let title_display = truncate(&pr.title, title_width);
 
@@ -191,14 +253,26 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             spans.push(Span::styled("  ", base_style));
             spans.push(Span::styled(stats, base_style.fg(t.text_dim)));
 
-            // Append review decision badge if present
-            if let Some(decision) = pr.review_decision.as_deref() {
+            // CI status badge — always renders a fixed-width span so columns align.
+            let ci_span = if let Some(state) = pr.ci_status.as_deref() {
+                let (text, color) = ci_badge(state);
+                let padded = format!("{:<width$}", format!("  {text}"), width = CI_COL_WIDTH);
+                Span::styled(padded, base_style.fg(color).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" ".repeat(CI_COL_WIDTH), base_style)
+            };
+
+            // Review decision badge — always renders a fixed-width span so columns align.
+            let review_span = if let Some(decision) = pr.review_decision.as_deref() {
                 let (text, color) = review_badge(decision);
-                spans.push(Span::styled(
-                    format!("  {text}"),
-                    base_style.fg(color).add_modifier(Modifier::BOLD),
-                ));
-            }
+                let padded = format!("{:<width$}", format!("  {text}"), width = REVIEW_COL_WIDTH);
+                Span::styled(padded, base_style.fg(color).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" ".repeat(REVIEW_COL_WIDTH), base_style)
+            };
+
+            spans.push(ci_span);
+            spans.push(review_span);
 
             ListItem::new(Line::from(spans))
         })
