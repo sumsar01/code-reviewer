@@ -5,7 +5,7 @@ use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     collections::HashSet,
@@ -88,8 +88,10 @@ pub struct App {
 
     pub diff_files: Vec<DiffFile>,
     pub diff_scroll: u16,
+    pub diff_hscroll: u16,
     pub diff_file_cursor: usize,
     pub diff_load_state: LoadState,
+    pub last_diff_area_height: u16,
 
     pub pr_comments: Vec<ReviewComment>,
     pub comments_scroll: u16,
@@ -97,8 +99,13 @@ pub struct App {
 
     pub difft_files: Vec<(String, String)>, // (filename, raw ansi output)
     pub difft_scroll: u16,
+    pub difft_hscroll: u16,
     pub difft_file_cursor: usize,
     pub difft_load_state: LoadState,
+
+    // Vim motion state
+    pub pending_count: String,
+    pub g_pending: bool,
 
     pub check_runs: Vec<CheckRun>,
     pub check_runs_load_state: LoadState,
@@ -152,15 +159,20 @@ impl App {
             pr_load_state: LoadState::Loading,
             diff_files: Vec::new(),
             diff_scroll: 0,
+            diff_hscroll: 0,
             diff_file_cursor: 0,
             diff_load_state: LoadState::Idle,
+            last_diff_area_height: 24,
             pr_comments: Vec::new(),
             comments_scroll: 0,
             comments_load_state: LoadState::Idle,
             difft_files: Vec::new(),
             difft_scroll: 0,
+            difft_hscroll: 0,
             difft_file_cursor: 0,
             difft_load_state: LoadState::Idle,
+            pending_count: String::new(),
+            g_pending: false,
             check_runs: Vec::new(),
             check_runs_load_state: LoadState::Idle,
             tx,
@@ -188,7 +200,7 @@ impl App {
             if event::poll(Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        if self.handle_key(key.code) {
+                        if self.handle_key(key.code, key.modifiers) {
                             break; // quit
                         }
                     }
@@ -204,7 +216,7 @@ impl App {
     // ── Key handling ──────────────────────────────────────────────────────────
 
     /// Returns `true` if the app should quit.
-    fn handle_key(&mut self, code: KeyCode) -> bool {
+    fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         // Theme picker intercepts everything when open.
         if self.show_theme_picker {
             return self.handle_key_theme_picker(code);
@@ -218,7 +230,7 @@ impl App {
 
         match &self.screen {
             Screen::PrList => self.handle_key_list(code),
-            Screen::PrDetail => self.handle_key_detail(code),
+            Screen::PrDetail => self.handle_key_detail(code, mods),
         }
     }
 
@@ -295,22 +307,80 @@ impl App {
         false
     }
 
-    fn handle_key_detail(&mut self, code: KeyCode) -> bool {
+    fn handle_key_detail(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         // ── File-tree focus: intercept j/k/Enter/Esc ─────────────────────────
         if self.detail_focus == DetailFocus::FileTree {
+            self.pending_count.clear();
+            self.g_pending = false;
             return self.handle_key_file_tree(code);
+        }
+
+        // ── Count prefix accumulation (digits 0-9) ───────────────────────────
+        // '0' with an existing count prefix is a count digit; bare '0' is "scroll to column 0".
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_digit() && (c != '0' || !self.pending_count.is_empty()) {
+                self.pending_count.push(c);
+                self.g_pending = false;
+                return false;
+            }
+        }
+
+        // Consume the count (default 1) and clear the buffer.
+        let count: u16 = self.pending_count.parse().unwrap_or(1).max(1);
+        self.pending_count.clear();
+
+        // ── Ctrl-d / Ctrl-u (half-page) ──────────────────────────────────────
+        if mods.contains(KeyModifiers::CONTROL) {
+            let half = (self.last_diff_area_height / 2).max(1);
+            let step = half.saturating_mul(count);
+            match code {
+                KeyCode::Char('d') => {
+                    self.g_pending = false;
+                    match self.detail_tab {
+                        DetailTab::Diff => {
+                            let max = self.max_diff_scroll();
+                            self.diff_scroll = self.diff_scroll.saturating_add(step).min(max);
+                        }
+                        DetailTab::Comments => {
+                            let max = self.max_comments_scroll();
+                            self.comments_scroll = self.comments_scroll.saturating_add(step).min(max);
+                        }
+                        DetailTab::Difftastic => {
+                            let max = self.max_difft_scroll();
+                            self.difft_scroll = self.difft_scroll.saturating_add(step).min(max);
+                        }
+                    }
+                    return false;
+                }
+                KeyCode::Char('u') => {
+                    self.g_pending = false;
+                    match self.detail_tab {
+                        DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(step),
+                        DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(step),
+                        DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(step),
+                    }
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
+                self.g_pending = false;
                 self.screen = Screen::PrList;
                 self.diff_scroll = 0;
+                self.diff_hscroll = 0;
                 self.comments_scroll = 0;
                 self.diff_file_cursor = 0;
             }
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.g_pending = false;
+                self.show_help = true;
+            }
             // Space: toggle tree panel visibility
             KeyCode::Char(' ') => {
+                self.g_pending = false;
                 match self.detail_tab {
                     DetailTab::Diff | DetailTab::Difftastic => {
                         self.show_file_tree = !self.show_file_tree;
@@ -322,6 +392,7 @@ impl App {
                 }
             }
             KeyCode::Tab => {
+                self.g_pending = false;
                 if self.show_file_tree
                     && matches!(self.detail_tab, DetailTab::Diff | DetailTab::Difftastic)
                 {
@@ -339,72 +410,157 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => match self.detail_tab {
-                DetailTab::Diff => {
-                    let max = self.max_diff_scroll();
-                    self.diff_scroll = self.diff_scroll.saturating_add(1).min(max);
+
+            // ── Vertical scroll: j / Down ────────────────────────────────────
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => {
+                        let max = self.max_diff_scroll();
+                        self.diff_scroll = self.diff_scroll.saturating_add(count).min(max);
+                    }
+                    DetailTab::Comments => {
+                        let max = self.max_comments_scroll();
+                        self.comments_scroll = self.comments_scroll.saturating_add(count).min(max);
+                    }
+                    DetailTab::Difftastic => {
+                        let max = self.max_difft_scroll();
+                        self.difft_scroll = self.difft_scroll.saturating_add(count).min(max);
+                    }
                 }
-                DetailTab::Comments => {
-                    let max = self.max_comments_scroll();
-                    self.comments_scroll = self.comments_scroll.saturating_add(1).min(max);
+            }
+
+            // ── Vertical scroll: k / Up ──────────────────────────────────────
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(count),
+                    DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(count),
+                    DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(count),
                 }
-                DetailTab::Difftastic => {
-                    let max = self.max_difft_scroll();
-                    self.difft_scroll = self.difft_scroll.saturating_add(1).min(max);
+            }
+
+            // ── Horizontal scroll: h / Left / l / Right ──────────────────────
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_hscroll = self.diff_hscroll.saturating_sub(count),
+                    DetailTab::Difftastic => self.difft_hscroll = self.difft_hscroll.saturating_sub(count),
+                    DetailTab::Comments => {}
                 }
-            },
-            KeyCode::Char('k') | KeyCode::Up => match self.detail_tab {
-                DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(1),
-                DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(1),
-                DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(1),
-            },
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_hscroll = self.diff_hscroll.saturating_add(count),
+                    DetailTab::Difftastic => self.difft_hscroll = self.difft_hscroll.saturating_add(count),
+                    DetailTab::Comments => {}
+                }
+            }
+
+            // ── G — jump to bottom ───────────────────────────────────────────
+            KeyCode::Char('G') => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_scroll = self.max_diff_scroll(),
+                    DetailTab::Comments => self.comments_scroll = self.max_comments_scroll(),
+                    DetailTab::Difftastic => self.difft_scroll = self.max_difft_scroll(),
+                }
+            }
+
+            // ── g — first press arms gg; second press jumps to top ───────────
+            KeyCode::Char('g') => {
+                if self.g_pending {
+                    // gg: jump to top
+                    self.g_pending = false;
+                    match self.detail_tab {
+                        DetailTab::Diff => self.diff_scroll = 0,
+                        DetailTab::Comments => self.comments_scroll = 0,
+                        DetailTab::Difftastic => self.difft_scroll = 0,
+                    }
+                } else {
+                    self.g_pending = true;
+                }
+            }
+
+            // ── 0 — scroll to leftmost column (bare zero, no count prefix) ───
+            KeyCode::Char('0') => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_hscroll = 0,
+                    DetailTab::Difftastic => self.difft_hscroll = 0,
+                    DetailTab::Comments => {}
+                }
+            }
+
+            // ── $ — scroll to far right (large sentinel value) ───────────────
+            KeyCode::Char('$') => {
+                self.g_pending = false;
+                match self.detail_tab {
+                    DetailTab::Diff => self.diff_hscroll = u16::MAX,
+                    DetailTab::Difftastic => self.difft_hscroll = u16::MAX,
+                    DetailTab::Comments => {}
+                }
+            }
+
+            // ── File navigation: n / N ────────────────────────────────────────
             KeyCode::Char('n') => {
+                self.g_pending = false;
                 match self.detail_tab {
                     DetailTab::Difftastic => {
                         if !self.difft_files.is_empty() {
                             self.difft_file_cursor =
-                                (self.difft_file_cursor + 1).min(self.difft_files.len() - 1);
+                                (self.difft_file_cursor + count as usize).min(self.difft_files.len() - 1);
                             self.difft_scroll = 0;
                         }
                     }
                     _ => {
                         if !self.diff_files.is_empty() {
                             self.diff_file_cursor =
-                                (self.diff_file_cursor + 1).min(self.diff_files.len() - 1);
+                                (self.diff_file_cursor + count as usize).min(self.diff_files.len() - 1);
                             self.diff_scroll = 0;
                         }
                     }
                 }
             }
             KeyCode::Char('N') => {
+                self.g_pending = false;
                 match self.detail_tab {
                     DetailTab::Difftastic => {
-                        self.difft_file_cursor = self.difft_file_cursor.saturating_sub(1);
+                        self.difft_file_cursor = self.difft_file_cursor.saturating_sub(count as usize);
                         self.difft_scroll = 0;
                     }
                     _ => {
-                        self.diff_file_cursor = self.diff_file_cursor.saturating_sub(1);
+                        self.diff_file_cursor = self.diff_file_cursor.saturating_sub(count as usize);
                         self.diff_scroll = 0;
                     }
                 }
             }
+
             KeyCode::Char('o') => {
+                self.g_pending = false;
                 if let Some(pr) = self.prs.get(self.pr_cursor) {
                     let _ = open::that(&pr.url);
                 }
             }
             KeyCode::Char('v') => {
+                self.g_pending = false;
                 self.toggle_reviewed();
             }
             KeyCode::Char('c') => {
+                self.g_pending = false;
                 self.checkout_pr_branch();
             }
             KeyCode::Char('T') => {
+                self.g_pending = false;
                 self.theme_picker_original = Some(self.theme.clone());
                 self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
                 self.show_theme_picker = true;
             }
-            _ => {}
+            _ => {
+                // Any unrecognised key clears the g-pending state.
+                self.g_pending = false;
+            }
         }
         false
     }

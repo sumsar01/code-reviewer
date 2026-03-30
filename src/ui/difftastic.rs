@@ -108,6 +108,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
 
     let lines = parse_ansi_to_lines_with_syntax(raw_ansi, filename, hl, t);
 
+    // Record viewport height for Ctrl-d/u half-page scroll.
+    app.last_diff_area_height = content_area.height.saturating_sub(2);
+
     let p = Paragraph::new(lines)
         .block(
             Block::default()
@@ -116,7 +119,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
                 .style(t.background_style())
                 .title(title),
         )
-        .scroll((app.difft_scroll, 0));
+        .scroll((app.difft_scroll, app.difft_hscroll));
     f.render_widget(p, content_area);
 }
 
