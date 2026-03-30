@@ -97,10 +97,33 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHi
     };
 
     let wide = diff_area.width >= SPLIT_THRESHOLD;
+
+    // Record the viewport height so Ctrl-d/u can compute half-page.
+    // Subtract 2 for the top/bottom borders of the paragraph block.
+    app.last_diff_area_height = diff_area.height.saturating_sub(2);
+
     if wide {
-        render_side_by_side(f, file, app.diff_scroll, diff_area, title, t, hl);
+        render_side_by_side(
+            f,
+            file,
+            app.diff_scroll,
+            app.diff_hscroll,
+            diff_area,
+            title,
+            t,
+            hl,
+        );
     } else {
-        render_unified(f, file, app.diff_scroll, diff_area, title, t, hl);
+        render_unified(
+            f,
+            file,
+            app.diff_scroll,
+            app.diff_hscroll,
+            diff_area,
+            title,
+            t,
+            hl,
+        );
     }
 }
 
@@ -237,6 +260,7 @@ fn render_unified(
     f: &mut Frame,
     file: &DiffFile,
     scroll: u16,
+    hscroll: u16,
     area: Rect,
     title: Line<'static>,
     t: &Theme,
@@ -251,7 +275,7 @@ fn render_unified(
                 .style(t.background_style())
                 .title(title),
         )
-        .scroll((scroll, 0));
+        .scroll((scroll, hscroll));
     f.render_widget(p, area);
 }
 
@@ -343,6 +367,7 @@ fn render_side_by_side(
     f: &mut Frame,
     file: &DiffFile,
     scroll: u16,
+    hscroll: u16,
     area: Rect,
     title: Line<'static>,
     t: &Theme,
@@ -364,7 +389,7 @@ fn render_side_by_side(
                 .title(title)
                 .title_bottom(Span::styled(" before ", t.text_dim_style())),
         )
-        .scroll((scroll, 0));
+        .scroll((scroll, hscroll));
     let right_p = Paragraph::new(right_lines)
         .block(
             Block::default()
@@ -373,7 +398,7 @@ fn render_side_by_side(
                 .style(t.background_style())
                 .title(Span::styled(" after ", t.text_dim_style())),
         )
-        .scroll((scroll, 0));
+        .scroll((scroll, hscroll));
 
     f.render_widget(left_p, chunks[0]);
     f.render_widget(right_p, chunks[1]);
