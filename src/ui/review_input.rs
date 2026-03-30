@@ -121,10 +121,10 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     // ── Key hint bar ──────────────────────────────────────────────────────────
     let submit_label = match &overlay.action {
-        ReviewAction::Approve => "Ctrl+Enter  Approve",
-        ReviewAction::RequestChanges => "Ctrl+Enter  Request Changes",
-        ReviewAction::InlineComment { .. } => "Ctrl+Enter  Post Comment",
-        _ => "Ctrl+Enter  Submit Comment",
+        ReviewAction::Approve => "Ctrl+Enter / Ctrl+S  Approve",
+        ReviewAction::RequestChanges => "Ctrl+Enter / Ctrl+S  Request Changes",
+        ReviewAction::InlineComment { .. } => "Ctrl+Enter / Ctrl+S  Post Comment",
+        _ => "Ctrl+Enter / Ctrl+S  Submit Comment",
     };
 
     let hints: &[(&str, &str)] = &[(submit_label, ""), ("Esc", "cancel"), ("Enter", "newline")];

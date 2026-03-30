@@ -290,6 +290,8 @@ pub struct App {
 
     /// Active review-input overlay (None when not shown).
     pub review_overlay: Option<ReviewOverlayState>,
+    /// Read-only comment peek overlay: shows existing comments on the cursor diff line.
+    pub comment_peek: Option<Vec<ReviewComment>>,
     /// Transient status message shown in the status bar (e.g. "Review submitted").
     pub status_message: Option<String>,
 
@@ -360,6 +362,7 @@ impl App {
             check_runs: Vec::new(),
             check_runs_load_state: LoadState::Idle,
             review_overlay: None,
+            comment_peek: None,
             status_message: None,
             tx,
             rx,
@@ -408,6 +411,12 @@ impl App {
             return self.handle_key_review_overlay(code, mods);
         }
 
+        // Comment peek overlay: any key closes it.
+        if self.comment_peek.is_some() {
+            self.comment_peek = None;
+            return false;
+        }
+
         // Theme picker intercepts everything when open.
         if self.show_theme_picker {
             return self.handle_key_theme_picker(code);
@@ -428,9 +437,16 @@ impl App {
     fn handle_key_review_overlay(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         // Ctrl+Enter submits; Esc cancels; everything else edits the buffer.
         if mods.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char('m') | KeyCode::Enter = code {
-                self.submit_review_overlay();
-                return false;
+            match code {
+                // KeyCode::Enter requires the keyboard enhancement protocol (enabled in main.rs).
+                // On terminals without enhancement (e.g. macOS Terminal), Ctrl+Enter sends
+                // Ctrl+m (carriage return), so we handle both.
+                // KeyCode::Char('s') is an explicit Ctrl+S fallback shown in the hint bar.
+                KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char('s') => {
+                    self.submit_review_overlay();
+                    return false;
+                }
+                _ => {}
             }
         }
 
@@ -907,6 +923,15 @@ impl App {
                     }
                 }
             }
+            // ── Enter — peek at existing comments on the cursor diff line ────
+            KeyCode::Enter => {
+                self.g_pending = false;
+                if self.detail_tab == DetailTab::Diff {
+                    if let Some(comments) = self.comments_at_cursor() {
+                        self.comment_peek = Some(comments);
+                    }
+                }
+            }
             _ => {
                 // Any unrecognised key clears the g-pending state.
                 self.g_pending = false;
@@ -1228,6 +1253,28 @@ impl App {
             }
         }
         None
+    }
+
+    /// Return any existing review comments attached to the current cursor diff line.
+    /// Returns `None` if the cursor is on a hunk header or there are no comments.
+    pub fn comments_at_cursor(&self) -> Option<Vec<ReviewComment>> {
+        let (path, diff_line) = self.diff_line_at_cursor()?;
+        // Use right_no for Added/Context lines, left_no for Removed — matching the
+        // marker logic in the diff renderer.
+        let line_no: u64 = match diff_line.kind {
+            crate::github::DiffLineKind::Removed => diff_line.left_no? as u64,
+            _ => diff_line.right_no? as u64,
+        };
+        let matches: Vec<ReviewComment> = self
+            .pr_comments
+            .iter()
+            .filter(|c| {
+                c.path.as_deref() == Some(&path)
+                    && c.line.map(|l| l == line_no).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if matches.is_empty() { None } else { Some(matches) }
     }
 
     /// Total rendered lines for comments.
