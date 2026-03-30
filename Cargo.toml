@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Keyboard-driven TUI for reviewing GitHub PRs"
 
+[lib]
+name = "code_reviewer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "prr"
 path = "src/main.rs"

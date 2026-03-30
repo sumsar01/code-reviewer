@@ -83,7 +83,7 @@ pub struct CheckRun {
 }
 
 pub struct GitHubClient {
-    pub octo: Octocrab,
+    octo: Octocrab,
     pub username: String,
 }
 
