@@ -367,6 +367,37 @@ impl GitHubClient {
         Ok(PrMetadata { review_decisions, ci_statuses })
     }
 
+    /// Submit a pull-request review (approve / request changes / comment).
+    ///
+    /// `event` must be one of `"APPROVE"`, `"REQUEST_CHANGES"`, or `"COMMENT"`.
+    /// `body` is the review comment text (required for REQUEST_CHANGES and COMMENT;
+    /// may be empty for APPROVE).
+    pub async fn submit_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        event: &str,
+        body: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "event": event,
+            "body": body,
+        });
+
+        self.octo
+            .post::<serde_json::Value, serde_json::Value>(
+                format!("/repos/{owner}/{repo}/pulls/{pr_number}/reviews"),
+                Some(&payload),
+            )
+            .await
+            .with_context(|| {
+                format!("Submitting {event} review for PR #{pr_number} on {owner}/{repo}")
+            })?;
+
+        Ok(())
+    }
+
     /// Fetch CI check results for a specific commit SHA.
     /// Uses `statusCheckRollup { contexts }` which returns both modern CheckRuns
     /// (Aikido, GitHub Actions) and legacy StatusContexts (CircleCI) in one query.

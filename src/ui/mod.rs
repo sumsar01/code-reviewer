@@ -5,6 +5,7 @@ pub mod file_tree;
 pub mod help;
 pub mod pr_detail;
 pub mod pr_list;
+pub mod review_input;
 pub mod theme;
 pub mod theme_picker;
 
@@ -25,5 +26,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.show_theme_picker {
         theme_picker::render(f, app, &t);
+    }
+
+    if app.review_overlay.is_some() {
+        review_input::render(f, app, &t);
     }
 }
