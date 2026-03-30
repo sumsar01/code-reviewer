@@ -22,6 +22,7 @@ pub struct PullRequest {
     pub deletions: Option<i64>,
     pub changed_files: Option<i64>,
     pub review_decision: Option<String>,
+    pub ci_status: Option<String>,
     pub body: Option<String>,
 }
 
@@ -63,6 +64,24 @@ pub struct DiffLine {
     pub content: String,
 }
 
+/// Combined per-PR metadata fetched in one GraphQL round-trip.
+pub struct PrMetadata {
+    pub review_decisions: HashMap<u64, String>,
+    pub ci_statuses: HashMap<u64, String>,
+}
+
+/// A single CI check run on a commit.
+#[derive(Debug, Clone)]
+pub struct CheckRun {
+    pub name: String,
+    /// "QUEUED" | "IN_PROGRESS" | "COMPLETED"
+    pub status: String,
+    /// "SUCCESS" | "FAILURE" | "SKIPPED" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | None
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
 pub struct GitHubClient {
     pub octo: Octocrab,
     pub username: String,
@@ -92,10 +111,14 @@ impl GitHubClient {
                 return Ok(Self { octo, username });
             }
 
-            // Org match: check if repo_owner is an org this account belongs to
+            // Org match: check if the authenticated user is a member of the org
+            // by querying their own membership. Uses /user/memberships/orgs/{org}
+            // which returns 200 only when the token's user actually belongs to the org.
             let is_member = octo
-                .orgs(repo_owner)
-                .check_membership(&username)
+                .get::<serde_json::Value, _, _>(
+                    format!("/user/memberships/orgs/{repo_owner}"),
+                    None::<&()>,
+                )
                 .await
                 .is_ok();
 
@@ -179,6 +202,7 @@ impl GitHubClient {
                     deletions: pr.deletions.map(|v| v as i64),
                     changed_files: pr.changed_files.map(|v| v as i64),
                     review_decision: None,
+                    ci_status: None,
                     body: pr.body.clone(),
                 });
             }
@@ -232,15 +256,18 @@ impl GitHubClient {
         Ok(result)
     }
 
-    /// Fetch `reviewDecision` for all open PRs in one GraphQL request.
+    /// Fetch `reviewDecision` and CI `statusCheckRollup` for all open PRs in one
+    /// GraphQL request.
     ///
-    /// Returns a map from PR number → review decision string
-    /// (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"REVIEW_REQUIRED"`, or absent when `null`).
+    /// Returns a `PrMetadata` with maps from PR number → review decision string
+    /// (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"REVIEW_REQUIRED"`, or absent when `null`)
+    /// and PR number → CI state string (`"SUCCESS"`, `"FAILURE"`, `"PENDING"`,
+    /// `"ERROR"`, `"EXPECTED"`, or absent when there are no checks).
     pub async fn fetch_review_decisions(
         &self,
         owner: &str,
         repo: &str,
-    ) -> Result<HashMap<u64, String>> {
+    ) -> Result<PrMetadata> {
         // GraphQL response shapes
         #[derive(Deserialize)]
         struct Response {
@@ -264,6 +291,24 @@ impl GitHubClient {
             number: u64,
             #[serde(rename = "reviewDecision")]
             review_decision: Option<String>,
+            commits: CommitConnection,
+        }
+        #[derive(Deserialize)]
+        struct CommitConnection {
+            nodes: Vec<CommitNode>,
+        }
+        #[derive(Deserialize)]
+        struct CommitNode {
+            commit: CommitObj,
+        }
+        #[derive(Deserialize)]
+        struct CommitObj {
+            #[serde(rename = "statusCheckRollup")]
+            status_check_rollup: Option<StatusRollup>,
+        }
+        #[derive(Deserialize)]
+        struct StatusRollup {
+            state: String,
         }
 
         let query = r#"
@@ -273,6 +318,15 @@ impl GitHubClient {
                   nodes {
                     number
                     reviewDecision
+                    commits(last: 1) {
+                      nodes {
+                        commit {
+                          statusCheckRollup {
+                            state
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -288,19 +342,172 @@ impl GitHubClient {
             .octo
             .graphql(&body)
             .await
-            .with_context(|| format!("GraphQL reviewDecision query for {owner}/{repo}"))?;
+            .with_context(|| format!("GraphQL reviewDecision+CI query for {owner}/{repo}"))?;
 
-        let mut map = HashMap::new();
+        let mut review_decisions = HashMap::new();
+        let mut ci_statuses = HashMap::new();
         if let Some(data) = resp.data {
             if let Some(repository) = data.repository {
                 for node in repository.pull_requests.nodes {
                     if let Some(decision) = node.review_decision {
-                        map.insert(node.number, decision);
+                        review_decisions.insert(node.number, decision);
+                    }
+                    if let Some(ci_state) = node
+                        .commits
+                        .nodes
+                        .first()
+                        .and_then(|cn| cn.commit.status_check_rollup.as_ref())
+                        .map(|r| r.state.clone())
+                    {
+                        ci_statuses.insert(node.number, ci_state);
                     }
                 }
             }
         }
-        Ok(map)
+        Ok(PrMetadata { review_decisions, ci_statuses })
+    }
+
+    /// Fetch CI check results for a specific commit SHA.
+    /// Uses `statusCheckRollup { contexts }` which returns both modern CheckRuns
+    /// (Aikido, GitHub Actions) and legacy StatusContexts (CircleCI) in one query.
+    pub async fn fetch_check_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        head_sha: &str,
+    ) -> Result<Vec<CheckRun>> {
+        #[derive(Deserialize)]
+        struct Response {
+            data: Option<Data>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        #[derive(Deserialize)]
+        struct Repository {
+            object: Option<GitObject>,
+        }
+        #[derive(Deserialize)]
+        struct GitObject {
+            #[serde(rename = "statusCheckRollup")]
+            status_check_rollup: Option<StatusCheckRollup>,
+        }
+        #[derive(Deserialize)]
+        struct StatusCheckRollup {
+            contexts: ContextConnection,
+        }
+        #[derive(Deserialize)]
+        struct ContextConnection {
+            nodes: Vec<ContextNode>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "__typename")]
+        enum ContextNode {
+            CheckRun {
+                name: String,
+                status: String,
+                conclusion: Option<String>,
+                #[serde(rename = "startedAt")]
+                started_at: Option<String>,
+                #[serde(rename = "completedAt")]
+                completed_at: Option<String>,
+            },
+            StatusContext {
+                context: String,
+                state: String,
+            },
+        }
+
+        let query = r#"
+            query($owner: String!, $repo: String!, $sha: GitObjectID!) {
+              repository(owner: $owner, name: $repo) {
+                object(oid: $sha) {
+                  ... on Commit {
+                    statusCheckRollup {
+                      contexts(first: 100) {
+                        nodes {
+                          __typename
+                          ... on CheckRun {
+                            name
+                            status
+                            conclusion
+                            startedAt
+                            completedAt
+                          }
+                          ... on StatusContext {
+                            context
+                            state
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+
+        let body = serde_json::json!({
+            "query": query,
+            "variables": { "owner": owner, "repo": repo, "sha": head_sha }
+        });
+
+        let resp: Response = self
+            .octo
+            .graphql(&body)
+            .await
+            .with_context(|| format!("GraphQL statusCheckRollup query for {owner}/{repo}@{head_sha}"))?;
+
+        let mut runs = Vec::new();
+        if let Some(data) = resp.data {
+            if let Some(repository) = data.repository {
+                if let Some(obj) = repository.object {
+                    if let Some(rollup) = obj.status_check_rollup {
+                        for node in rollup.contexts.nodes {
+                            match node {
+                                ContextNode::CheckRun {
+                                    name,
+                                    status,
+                                    conclusion,
+                                    started_at,
+                                    completed_at,
+                                } => {
+                                    runs.push(CheckRun {
+                                        name,
+                                        status,
+                                        conclusion,
+                                        started_at,
+                                        completed_at,
+                                    });
+                                }
+                                ContextNode::StatusContext { context, state } => {
+                                    // Normalize legacy Status API state into CheckRun fields.
+                                    // Strip common "ci/circleci: " prefix for cleaner names.
+                                    let name = context
+                                        .strip_prefix("ci/circleci: ")
+                                        .unwrap_or(&context)
+                                        .to_string();
+                                    let (status, conclusion) = match state.to_uppercase().as_str() {
+                                        "SUCCESS" => ("COMPLETED".to_string(), Some("SUCCESS".to_string())),
+                                        "FAILURE" | "ERROR" => ("COMPLETED".to_string(), Some("FAILURE".to_string())),
+                                        _ => ("IN_PROGRESS".to_string(), None), // PENDING
+                                    };
+                                    runs.push(CheckRun {
+                                        name,
+                                        status,
+                                        conclusion,
+                                        started_at: None,
+                                        completed_at: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(runs)
     }
 }
 

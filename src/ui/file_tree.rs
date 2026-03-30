@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
+use std::collections::HashSet;
 
 // ── Tree data model ──────────────────────────────────────────────────────────
 
@@ -108,10 +109,11 @@ fn emit_rows(node: &DirNode, depth: usize, out: &mut Vec<TreeRow>) {
 
 /// Render the file tree panel.
 ///
-/// * `rows`         – pre-built list from `build_rows`
-/// * `tree_cursor`  – currently highlighted row index (including dir rows)
-/// * `active_file`  – the currently-viewed file index (highlighted differently)
-/// * `focused`      – whether the tree panel has keyboard focus
+/// * `rows`            – pre-built list from `build_rows`
+/// * `tree_cursor`     – currently highlighted row index (including dir rows)
+/// * `active_file`     – the currently-viewed file index (highlighted differently)
+/// * `focused`         – whether the tree panel has keyboard focus
+/// * `reviewed`        – set of file indices that have been marked as reviewed
 pub fn render(
     f: &mut Frame,
     rows: &[TreeRow],
@@ -120,6 +122,7 @@ pub fn render(
     focused: bool,
     area: Rect,
     t: &Theme,
+    reviewed: &HashSet<usize>,
 ) {
     let border_style = if focused {
         t.border_style()
@@ -134,6 +137,7 @@ pub fn render(
             let is_cursor = i == tree_cursor;
             let is_active_file = row.file_index == Some(active_file);
             let is_dir = row.file_index.is_none();
+            let is_reviewed = row.file_index.map_or(false, |fi| reviewed.contains(&fi));
 
             let style = if is_cursor && focused {
                 // Cursor row with focus: full selection highlight
@@ -142,18 +146,26 @@ pub fn render(
                     .fg(t.selection_fg)
                     .add_modifier(Modifier::BOLD)
             } else if is_active_file {
-                // Currently-viewed file (accent color even without focus)
+                // Currently-viewed file: accent color, full brightness (overrides reviewed)
                 Style::default()
                     .fg(t.text_accent)
                     .add_modifier(Modifier::BOLD)
+            } else if is_reviewed {
+                // Reviewed files: struck-through + dim to indicate "done"
+                Style::default()
+                    .fg(t.text_dim)
+                    .add_modifier(Modifier::CROSSED_OUT)
+                    .add_modifier(Modifier::DIM)
             } else if is_dir {
                 Style::default().fg(t.text_dim)
             } else {
                 Style::default().fg(t.text)
             };
 
+            let prefix = if is_active_file { "▶ " } else { "  " };
+
             ListItem::new(Line::from(Span::styled(
-                format!("{}{}", if is_active_file { "▶ " } else { "  " }, row.label),
+                format!("{}{}", prefix, row.label),
                 style,
             )))
         })

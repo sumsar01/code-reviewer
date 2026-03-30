@@ -1,6 +1,6 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
-use crate::github::{DiffFile, GitHubClient, PullRequest, ReviewComment, parse_diff};
+use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, ReviewComment, parse_diff};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     io,
     process::Command,
     sync::Arc,
@@ -52,13 +52,15 @@ pub enum LoadState {
 enum BgMsg {
     PrsLoaded(Vec<PullRequest>),
     PrsError(String),
-    ReviewDecisionsLoaded(HashMap<u64, String>),
+    ReviewDecisionsLoaded(PrMetadata),
     DiffLoaded(Vec<DiffFile>),
     DiffError(String),
     CommentsLoaded(Vec<ReviewComment>),
     CommentsError(String),
     DifftLoaded(Vec<(String, String)>),
     DifftError(String),
+    CheckRunsLoaded(Vec<CheckRun>),
+    CheckRunsError(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -97,6 +99,9 @@ pub struct App {
     pub difft_scroll: u16,
     pub difft_file_cursor: usize,
     pub difft_load_state: LoadState,
+
+    pub check_runs: Vec<CheckRun>,
+    pub check_runs_load_state: LoadState,
 
     tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -156,6 +161,8 @@ impl App {
             difft_scroll: 0,
             difft_file_cursor: 0,
             difft_load_state: LoadState::Idle,
+            check_runs: Vec::new(),
+            check_runs_load_state: LoadState::Idle,
             tx,
             rx,
         };
@@ -386,6 +393,9 @@ impl App {
                     let _ = open::that(&pr.url);
                 }
             }
+            KeyCode::Char('v') => {
+                self.toggle_reviewed();
+            }
             KeyCode::Char('c') => {
                 self.checkout_pr_branch();
             }
@@ -476,10 +486,13 @@ impl App {
             BgMsg::PrsError(e) => {
                 self.pr_load_state = LoadState::Error(e);
             }
-            BgMsg::ReviewDecisionsLoaded(decisions) => {
+            BgMsg::ReviewDecisionsLoaded(meta) => {
                 for pr in &mut self.prs {
-                    if let Some(decision) = decisions.get(&pr.number) {
+                    if let Some(decision) = meta.review_decisions.get(&pr.number) {
                         pr.review_decision = Some(decision.clone());
+                    }
+                    if let Some(ci_state) = meta.ci_statuses.get(&pr.number) {
+                        pr.ci_status = Some(ci_state.clone());
                     }
                 }
             }
@@ -509,6 +522,13 @@ impl App {
             BgMsg::DifftError(e) => {
                 self.difft_load_state = LoadState::Error(e);
             }
+            BgMsg::CheckRunsLoaded(runs) => {
+                self.check_runs = runs;
+                self.check_runs_load_state = LoadState::Idle;
+            }
+            BgMsg::CheckRunsError(e) => {
+                self.check_runs_load_state = LoadState::Error(e);
+            }
         }
     }
 
@@ -534,10 +554,10 @@ impl App {
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
-            match gh.fetch_review_decisions(&repo.owner, &repo.name).await {
-                Ok(decisions) => { let _ = tx.send(BgMsg::ReviewDecisionsLoaded(decisions)); }
-                Err(_) => {} // silently ignore — review decisions are best-effort
-            }
+                match gh.fetch_review_decisions(&repo.owner, &repo.name).await {
+                    Ok(meta) => { let _ = tx.send(BgMsg::ReviewDecisionsLoaded(meta)); }
+                    Err(_) => {} // silently ignore — review decisions are best-effort
+                }
         });
     }
 
@@ -566,6 +586,19 @@ impl App {
             match gh.pr_comments(&repo.owner, &repo.name, pr_number).await {
                 Ok(comments) => { let _ = tx.send(BgMsg::CommentsLoaded(comments)); }
                 Err(e) => { let _ = tx.send(BgMsg::CommentsError(format!("{:#}", e))); }
+            }
+        });
+    }
+
+    fn fetch_check_runs(&self, head_sha: String) {
+        let Some(repo) = self.repo.clone() else { return };
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            match gh.fetch_check_runs(&repo.owner, &repo.name, &head_sha).await {
+                Ok(runs) => { let _ = tx.send(BgMsg::CheckRunsLoaded(runs)); }
+                Err(e) => { let _ = tx.send(BgMsg::CheckRunsError(format!("{:#}", e))); }
             }
         });
     }
@@ -676,10 +709,102 @@ impl App {
         self.comments_load_state = LoadState::Loading;
         self.difft_files = Vec::new();
         self.difft_load_state = LoadState::Loading;
+        self.check_runs = Vec::new();
+        self.check_runs_load_state = LoadState::Loading;
 
         self.fetch_diff(pr_number);
         self.fetch_comments(pr_number);
-        self.fetch_difft(base_sha, head_sha);
+        self.fetch_difft(base_sha, head_sha.clone());
+        self.fetch_check_runs(head_sha);
+    }
+
+    /// Returns the set of file indices (into `diff_files`) that are marked reviewed
+    /// for the currently open PR.
+    pub fn reviewed_diff_indices(&self) -> HashSet<usize> {
+        let Some(repo) = &self.repo else { return HashSet::new() };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return HashSet::new() };
+        self.diff_files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| self.config.is_reviewed(&repo.owner, &repo.name, pr.number, &f.filename))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Returns the set of file indices (into `difft_files`) that are marked reviewed
+    /// for the currently open PR.
+    pub fn reviewed_difft_indices(&self) -> HashSet<usize> {
+        let Some(repo) = &self.repo else { return HashSet::new() };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return HashSet::new() };
+        self.difft_files
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| self.config.is_reviewed(&repo.owner, &repo.name, pr.number, name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Returns (reviewed_count, total_count) for the current PR's diff files.
+    pub fn reviewed_progress(&self) -> (usize, usize) {
+        let total = self.diff_files.len();
+        let reviewed = self.reviewed_diff_indices().len();
+        (reviewed, total)
+    }
+
+    /// Toggle the current file's reviewed state and auto-advance to the next unreviewed file.
+    fn toggle_reviewed(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return };
+        let pr_number = pr.number;
+        let owner = repo.owner.clone();
+        let repo_name = repo.name.clone();
+
+        let (file_cursor, total_files) = match self.detail_tab {
+            DetailTab::Diff => (self.diff_file_cursor, self.diff_files.len()),
+            DetailTab::Difftastic => (self.difft_file_cursor, self.difft_files.len()),
+            DetailTab::Comments => return,
+        };
+
+        let filename = match self.detail_tab {
+            DetailTab::Diff => self.diff_files.get(file_cursor).map(|f| f.filename.clone()),
+            DetailTab::Difftastic => self.difft_files.get(file_cursor).map(|(n, _)| n.clone()),
+            DetailTab::Comments => None,
+        };
+        let Some(filename) = filename else { return };
+
+        self.config.toggle_reviewed(&owner, &repo_name, pr_number, &filename);
+
+        // Auto-advance to next unreviewed file (wrap around)
+        if total_files > 1 {
+            let next = (1..total_files)
+                .map(|offset| (file_cursor + offset) % total_files)
+                .find(|&idx| {
+                    let fname = match self.detail_tab {
+                        DetailTab::Diff => self.diff_files.get(idx).map(|f| f.filename.as_str()),
+                        DetailTab::Difftastic => {
+                            self.difft_files.get(idx).map(|(n, _)| n.as_str())
+                        }
+                        DetailTab::Comments => None,
+                    };
+                    fname.map_or(false, |f| {
+                        !self.config.is_reviewed(&owner, &repo_name, pr_number, f)
+                    })
+                });
+
+            if let Some(next_idx) = next {
+                match self.detail_tab {
+                    DetailTab::Diff => {
+                        self.diff_file_cursor = next_idx;
+                        self.diff_scroll = 0;
+                    }
+                    DetailTab::Difftastic => {
+                        self.difft_file_cursor = next_idx;
+                        self.difft_scroll = 0;
+                    }
+                    DetailTab::Comments => {}
+                }
+            }
+        }
     }
 
     fn checkout_pr_branch(&mut self) {
