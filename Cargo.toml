@@ -3,6 +3,7 @@ name = "code-reviewer"
 version = "0.1.0"
 edition = "2021"
 description = "Keyboard-driven TUI for reviewing GitHub PRs"
+repository = "https://github.com/sumsar01/code-reviewer"
 
 [lib]
 name = "code_reviewer"
@@ -54,3 +55,6 @@ dirs-next = "2"
 # Error handling
 anyhow = "1"
 thiserror = "2"
+
+# HTTP for unauthenticated update check
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

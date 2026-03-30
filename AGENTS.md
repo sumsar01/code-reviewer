@@ -148,3 +148,53 @@ For more details, see README.md and docs/QUICKSTART.md.
 - If push fails, resolve and retry until it succeeds
 
 <!-- END BEADS INTEGRATION -->
+
+## Release Workflow
+
+Releases are managed via **GitHub Releases**. The `prr` binary checks
+`https://api.github.com/repos/sumsar01/code-reviewer/releases/latest` at
+startup and prompts the user to update when a newer release tag is found.
+
+The version tag **must** be prefixed with `v` (e.g. `v0.2.0`) for the
+auto-updater to detect it correctly.
+
+### Steps to cut a new release
+
+1. **Bump the version** in `Cargo.toml`:
+   ```
+   version = "0.2.0"
+   ```
+
+2. **Rebuild** to update `Cargo.lock`:
+   ```bash
+   cargo build
+   ```
+
+3. **Commit**:
+   ```bash
+   git commit -am "chore: bump version to v0.2.0"
+   ```
+
+4. **Tag**:
+   ```bash
+   git tag v0.2.0
+   ```
+
+5. **Push the tag**:
+   ```bash
+   git push origin v0.2.0
+   ```
+
+6. **Create the GitHub Release** (generates release notes from commits):
+   ```bash
+   gh release create v0.2.0 --generate-notes --title "v0.2.0"
+   ```
+
+7. **Verify** the release is live:
+   ```bash
+   gh release view v0.2.0
+   ```
+   Or check `https://github.com/sumsar01/code-reviewer/releases/latest`.
+
+Once the release exists, existing `prr` installs will prompt users to update
+on their next startup.

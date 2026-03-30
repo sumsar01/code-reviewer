@@ -379,7 +379,7 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
 fn render_statusbar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     // If there's a transient status message (e.g. after submitting a review),
     // show it instead of the normal key-hint bar.
-    if let Some(msg) = &app.status_message {
+    if let Some((msg, _)) = &app.status_message {
         use ratatui::style::Color;
         let p = Paragraph::new(Line::from(vec![
             Span::raw(" "),

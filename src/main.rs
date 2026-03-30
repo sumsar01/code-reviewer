@@ -5,6 +5,7 @@ mod git;
 mod github;
 mod syntax;
 mod ui;
+mod updater;
 
 use anyhow::Result;
 use app::App;
