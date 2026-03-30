@@ -24,6 +24,15 @@ pub enum ReviewAction {
     Approve,
     RequestChanges,
     Comment,
+    /// Inline comment on a specific diff line.
+    InlineComment {
+        /// File path relative to repo root.
+        path: String,
+        /// Absolute line number on the chosen side.
+        line: u64,
+        /// `"LEFT"` for removed lines, `"RIGHT"` for added/context lines.
+        side: String,
+    },
 }
 
 impl ReviewAction {
@@ -32,6 +41,7 @@ impl ReviewAction {
             ReviewAction::Approve => "Approve PR",
             ReviewAction::RequestChanges => "Request Changes",
             ReviewAction::Comment => "Leave Comment",
+            ReviewAction::InlineComment { .. } => "Inline Comment",
         }
     }
 
@@ -40,12 +50,16 @@ impl ReviewAction {
             ReviewAction::Approve => "APPROVE",
             ReviewAction::RequestChanges => "REQUEST_CHANGES",
             ReviewAction::Comment => "COMMENT",
+            ReviewAction::InlineComment { .. } => "COMMENT",
         }
     }
 
     /// Whether a non-empty body is required before submitting.
     pub fn body_required(&self) -> bool {
-        matches!(self, ReviewAction::RequestChanges | ReviewAction::Comment)
+        matches!(
+            self,
+            ReviewAction::RequestChanges | ReviewAction::Comment | ReviewAction::InlineComment { .. }
+        )
     }
 }
 
@@ -221,6 +235,8 @@ enum BgMsg {
     CheckRunsError(String),
     ReviewSubmitted,
     ReviewError(String),
+    InlineCommentSubmitted,
+    InlineCommentError(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -250,6 +266,8 @@ pub struct App {
     pub diff_scroll: u16,
     pub diff_hscroll: u16,
     pub diff_file_cursor: usize,
+    /// Index of the highlighted diff row (hunk headers + diff lines, 0-based).
+    pub diff_line_cursor: usize,
     pub diff_load_state: LoadState,
     pub last_diff_area_height: u16,
 
@@ -326,6 +344,7 @@ impl App {
             diff_scroll: 0,
             diff_hscroll: 0,
             diff_file_cursor: 0,
+            diff_line_cursor: 0,
             diff_load_state: LoadState::Idle,
             last_diff_area_height: 24,
             pr_comments: Vec::new(),
@@ -474,16 +493,43 @@ impl App {
         let Some(repo) = self.repo.clone() else { return };
         let gh = Arc::clone(&self.github);
         let tx = self.tx.clone();
-        let event = overlay.action.event_str().to_string();
 
-        tokio::spawn(async move {
-            match gh.submit_review(&repo.owner, &repo.name, pr_number, &event, &body).await {
-                Ok(()) => { let _ = tx.send(BgMsg::ReviewSubmitted); }
-                Err(e) => { let _ = tx.send(BgMsg::ReviewError(format!("{:#}", e))); }
-            }
-        });
-
+        // Clone the action before moving out of the overlay.
+        let action = overlay.action.clone();
         self.review_overlay = None;
+
+        match action {
+            ReviewAction::InlineComment { path, line, side } => {
+                let commit_id = pr.head_sha.clone();
+                tokio::spawn(async move {
+                    match gh
+                        .create_review_comment(
+                            &repo.owner,
+                            &repo.name,
+                            pr_number,
+                            &commit_id,
+                            &path,
+                            line,
+                            &side,
+                            &body,
+                        )
+                        .await
+                    {
+                        Ok(()) => { let _ = tx.send(BgMsg::InlineCommentSubmitted); }
+                        Err(e) => { let _ = tx.send(BgMsg::InlineCommentError(format!("{:#}", e))); }
+                    }
+                });
+            }
+            _ => {
+                let event = action.event_str().to_string();
+                tokio::spawn(async move {
+                    match gh.submit_review(&repo.owner, &repo.name, pr_number, &event, &body).await {
+                        Ok(()) => { let _ = tx.send(BgMsg::ReviewSubmitted); }
+                        Err(e) => { let _ = tx.send(BgMsg::ReviewError(format!("{:#}", e))); }
+                    }
+                });
+            }
+        }
     }
 
     fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {        match code {
@@ -624,6 +670,7 @@ impl App {
                 self.diff_hscroll = 0;
                 self.comments_scroll = 0;
                 self.diff_file_cursor = 0;
+                self.diff_line_cursor = 0;
             }
             KeyCode::Char('?') => {
                 self.g_pending = false;
@@ -669,6 +716,7 @@ impl App {
                     DetailTab::Diff => {
                         let max = self.max_diff_scroll();
                         self.diff_scroll = self.diff_scroll.saturating_add(count).min(max);
+                        self.diff_line_cursor = self.diff_line_cursor.saturating_add(count as usize).min(max as usize);
                     }
                     DetailTab::Comments => {
                         let max = self.max_comments_scroll();
@@ -685,7 +733,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.g_pending = false;
                 match self.detail_tab {
-                    DetailTab::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(count),
+                    DetailTab::Diff => {
+                        self.diff_scroll = self.diff_scroll.saturating_sub(count);
+                        self.diff_line_cursor = self.diff_line_cursor.saturating_sub(count as usize);
+                    }
                     DetailTab::Comments => self.comments_scroll = self.comments_scroll.saturating_sub(count),
                     DetailTab::Difftastic => self.difft_scroll = self.difft_scroll.saturating_sub(count),
                 }
@@ -713,7 +764,11 @@ impl App {
             KeyCode::Char('G') => {
                 self.g_pending = false;
                 match self.detail_tab {
-                    DetailTab::Diff => self.diff_scroll = self.max_diff_scroll(),
+                    DetailTab::Diff => {
+                        let max = self.max_diff_scroll();
+                        self.diff_scroll = max;
+                        self.diff_line_cursor = max as usize;
+                    }
                     DetailTab::Comments => self.comments_scroll = self.max_comments_scroll(),
                     DetailTab::Difftastic => self.difft_scroll = self.max_difft_scroll(),
                 }
@@ -725,7 +780,10 @@ impl App {
                     // gg: jump to top
                     self.g_pending = false;
                     match self.detail_tab {
-                        DetailTab::Diff => self.diff_scroll = 0,
+                        DetailTab::Diff => {
+                            self.diff_scroll = 0;
+                            self.diff_line_cursor = 0;
+                        }
                         DetailTab::Comments => self.comments_scroll = 0,
                         DetailTab::Difftastic => self.difft_scroll = 0,
                     }
@@ -770,6 +828,7 @@ impl App {
                             self.diff_file_cursor =
                                 (self.diff_file_cursor + count as usize).min(self.diff_files.len() - 1);
                             self.diff_scroll = 0;
+                            self.diff_line_cursor = 0;
                         }
                     }
                 }
@@ -784,6 +843,7 @@ impl App {
                     _ => {
                         self.diff_file_cursor = self.diff_file_cursor.saturating_sub(count as usize);
                         self.diff_scroll = 0;
+                        self.diff_line_cursor = 0;
                     }
                 }
             }
@@ -822,6 +882,30 @@ impl App {
                 self.g_pending = false;
                 self.status_message = None;
                 self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::Comment));
+            }
+            // ── i — inline comment on the current diff line ──────────────────
+            KeyCode::Char('i') => {
+                self.g_pending = false;
+                if self.detail_tab == DetailTab::Diff {
+                    if let Some((path, diff_line)) = self.diff_line_at_cursor() {
+                        let (line, side) = match diff_line.kind {
+                            crate::github::DiffLineKind::Removed => {
+                                (diff_line.left_no.unwrap_or(1) as u64, "LEFT".to_string())
+                            }
+                            _ => {
+                                (diff_line.right_no.unwrap_or(1) as u64, "RIGHT".to_string())
+                            }
+                        };
+                        self.status_message = None;
+                        self.review_overlay = Some(ReviewOverlayState::new(
+                            ReviewAction::InlineComment { path, line, side },
+                        ));
+                    } else {
+                        self.status_message = Some(
+                            "Cursor is on a hunk header — move to a diff line first".to_string(),
+                        );
+                    }
+                }
             }
             _ => {
                 // Any unrecognised key clears the g-pending state.
@@ -872,6 +956,7 @@ impl App {
                             DetailTab::Diff => {
                                 self.diff_file_cursor = file_idx;
                                 self.diff_scroll = 0;
+                                self.diff_line_cursor = 0;
                             }
                             DetailTab::Difftastic => {
                                 self.difft_file_cursor = file_idx;
@@ -923,6 +1008,7 @@ impl App {
                 self.diff_load_state = LoadState::Idle;
                 self.diff_file_cursor = 0;
                 self.diff_scroll = 0;
+                self.diff_line_cursor = 0;
             }
             BgMsg::DiffError(e) => {
                 self.diff_load_state = LoadState::Error(e);
@@ -958,6 +1044,17 @@ impl App {
             }
             BgMsg::ReviewError(e) => {
                 self.status_message = Some(format!("Review error: {e}"));
+            }
+            BgMsg::InlineCommentSubmitted => {
+                self.status_message = Some("Inline comment posted".to_string());
+                // Re-fetch comments so the new one appears in the Comments tab
+                if let Some(pr) = self.prs.get(self.pr_cursor) {
+                    let pr_number = pr.number;
+                    self.fetch_comments(pr_number);
+                }
+            }
+            BgMsg::InlineCommentError(e) => {
+                self.status_message = Some(format!("Comment error: {e}"));
             }
         }
     }
@@ -1103,6 +1200,34 @@ impl App {
             f.hunks.iter().map(|h| 1 + h.lines.len()).sum()
         }).unwrap_or(0);
         (total as u16).saturating_sub(1)
+    }
+
+    /// Resolve the diff line at `diff_line_cursor` in the current file.
+    ///
+    /// The rendered rows interleave hunk-header rows (no line number) with diff
+    /// lines.  This method walks the hunks in order, counting each hunk header
+    /// as one row, and returns the `DiffLine` when the cursor lands on an actual
+    /// diff line (skipping hunk-header rows).
+    ///
+    /// Returns `(file_path, diff_line)` if the cursor is on a commentable row,
+    /// or `None` when it is on a hunk-header row or out of bounds.
+    pub fn diff_line_at_cursor(&self) -> Option<(String, &crate::github::DiffLine)> {
+        let file = self.diff_files.get(self.diff_file_cursor)?;
+        let mut row = 0usize;
+        for hunk in &file.hunks {
+            // hunk-header row
+            if row == self.diff_line_cursor {
+                return None; // cursor is on a hunk header — not commentable
+            }
+            row += 1;
+            for diff_line in &hunk.lines {
+                if row == self.diff_line_cursor {
+                    return Some((file.filename.clone(), diff_line));
+                }
+                row += 1;
+            }
+        }
+        None
     }
 
     /// Total rendered lines for comments.

@@ -33,6 +33,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("A", "Approve PR (opens input overlay)"),
     ("R", "Request changes (opens input overlay)"),
     ("C", "Leave a review comment (opens input overlay)"),
+    ("i", "Inline comment on cursor diff line (opens input overlay)"),
     ("", ""),
     ("Review overlay", ""),
     ("Enter", "Insert newline"),

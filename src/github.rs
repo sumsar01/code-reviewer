@@ -398,6 +398,47 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Post a single inline review comment on a specific diff line.
+    ///
+    /// * `commit_id` — the PR's head SHA (available as `PullRequest::head_sha`)
+    /// * `path`      — file path relative to the repo root
+    /// * `line`      — the line number on the chosen side
+    /// * `side`      — `"LEFT"` for removed lines, `"RIGHT"` for added/context lines
+    /// * `body`      — comment text
+    pub async fn create_review_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        commit_id: &str,
+        path: &str,
+        line: u64,
+        side: &str,
+        body: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "body": body,
+            "commit_id": commit_id,
+            "path": path,
+            "line": line,
+            "side": side,
+        });
+
+        self.octo
+            .post::<serde_json::Value, serde_json::Value>(
+                format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments"),
+                Some(&payload),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Posting inline comment on {path}:{line} ({side}) for PR #{pr_number} on {owner}/{repo}"
+                )
+            })?;
+
+        Ok(())
+    }
+
     /// Fetch CI check results for a specific commit SHA.
     /// Uses `statusCheckRollup { contexts }` which returns both modern CheckRuns
     /// (Aikido, GitHub Actions) and legacy StatusContexts (CircleCI) in one query.
