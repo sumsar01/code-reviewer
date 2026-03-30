@@ -72,7 +72,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
         DetailTab::Difftastic => difftastic::render(f, app, chunks[2], t, hl),
     }
 
-    render_statusbar(f, chunks[3], t);
+    render_statusbar(f, app, chunks[3], t);
 }
 
 fn render_pr_header(
@@ -376,13 +376,32 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     f.render_widget(tabs, area);
 }
 
-fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
+fn render_statusbar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    // If there's a transient status message (e.g. after submitting a review),
+    // show it instead of the normal key-hint bar.
+    if let Some(msg) = &app.status_message {
+        use ratatui::style::Color;
+        let p = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                msg.as_str().to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(t.background_style());
+        f.render_widget(p, area);
+        return;
+    }
+
     let hints: &[(&str, &str)] = &[
         ("Tab", "focus tree/content"),
         ("Space", "toggle tree"),
         ("j/k", "scroll"),
         ("n/N", "next/prev file"),
         ("v", "mark reviewed"),
+        ("A/R/C", "approve/request/comment"),
         ("c", "checkout"),
         ("o", "browser"),
         ("T", "theme"),

@@ -18,6 +18,164 @@ use tokio::sync::mpsc;
 
 // ── State enums ───────────────────────────────────────────────────────────────
 
+/// Which kind of GitHub review to submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewAction {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewAction {
+    pub fn title(&self) -> &'static str {
+        match self {
+            ReviewAction::Approve => "Approve PR",
+            ReviewAction::RequestChanges => "Request Changes",
+            ReviewAction::Comment => "Leave Comment",
+        }
+    }
+
+    pub fn event_str(&self) -> &'static str {
+        match self {
+            ReviewAction::Approve => "APPROVE",
+            ReviewAction::RequestChanges => "REQUEST_CHANGES",
+            ReviewAction::Comment => "COMMENT",
+        }
+    }
+
+    /// Whether a non-empty body is required before submitting.
+    pub fn body_required(&self) -> bool {
+        matches!(self, ReviewAction::RequestChanges | ReviewAction::Comment)
+    }
+}
+
+/// State for the review-input overlay (multi-line text editor).
+#[derive(Debug, Clone)]
+pub struct ReviewOverlayState {
+    pub action: ReviewAction,
+    /// Lines of text in the input buffer.
+    pub lines: Vec<String>,
+    /// Index into `lines` of the cursor row.
+    pub cursor_row: usize,
+    /// Byte offset within `lines[cursor_row]` of the cursor column.
+    pub cursor_col: usize,
+    /// Non-empty when the overlay should display a validation error.
+    pub error: Option<String>,
+}
+
+impl ReviewOverlayState {
+    pub fn new(action: ReviewAction) -> Self {
+        Self {
+            action,
+            lines: vec![String::new()],
+            cursor_row: 0,
+            cursor_col: 0,
+            error: None,
+        }
+    }
+
+    /// Return the body text as a single string (lines joined by `\n`).
+    pub fn body(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Insert a character at the current cursor position.
+    pub fn insert_char(&mut self, ch: char) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        self.lines[row].insert(col, ch);
+        self.cursor_col += ch.len_utf8();
+        self.error = None;
+    }
+
+    /// Insert a newline at the current cursor position (split the line).
+    pub fn insert_newline(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let tail = self.lines[row].split_off(col);
+        self.lines.insert(row + 1, tail);
+        self.cursor_row += 1;
+        self.cursor_col = 0;
+        self.error = None;
+    }
+
+    /// Delete the character before the cursor (backspace).
+    pub fn backspace(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        if col > 0 {
+            // Find the previous char boundary
+            let line = &self.lines[row];
+            let prev = line[..col]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.lines[row].remove(prev);
+            self.cursor_col = prev;
+        } else if row > 0 {
+            // Merge this line into the previous one
+            let current = self.lines.remove(row);
+            let prev_len = self.lines[row - 1].len();
+            self.lines[row - 1].push_str(&current);
+            self.cursor_row -= 1;
+            self.cursor_col = prev_len;
+        }
+        self.error = None;
+    }
+
+    /// Move cursor left one character.
+    pub fn move_left(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        if col > 0 {
+            let prev = self.lines[row][..col]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.cursor_col = prev;
+        } else if row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].len();
+        }
+    }
+
+    /// Move cursor right one character.
+    pub fn move_right(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let line_len = self.lines[row].len();
+        if col < line_len {
+            let next = self.lines[row][col..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| col + i)
+                .unwrap_or(line_len);
+            self.cursor_col = next;
+        } else if row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+    }
+
+    /// Move cursor up one row, clamping column.
+    pub fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+        }
+    }
+
+    /// Move cursor down one row, clamping column.
+    pub fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     PrList,
@@ -61,6 +219,8 @@ enum BgMsg {
     DifftError(String),
     CheckRunsLoaded(Vec<CheckRun>),
     CheckRunsError(String),
+    ReviewSubmitted,
+    ReviewError(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -109,6 +269,11 @@ pub struct App {
 
     pub check_runs: Vec<CheckRun>,
     pub check_runs_load_state: LoadState,
+
+    /// Active review-input overlay (None when not shown).
+    pub review_overlay: Option<ReviewOverlayState>,
+    /// Transient status message shown in the status bar (e.g. "Review submitted").
+    pub status_message: Option<String>,
 
     tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -175,6 +340,8 @@ impl App {
             g_pending: false,
             check_runs: Vec::new(),
             check_runs_load_state: LoadState::Idle,
+            review_overlay: None,
+            status_message: None,
             tx,
             rx,
         };
@@ -217,6 +384,11 @@ impl App {
 
     /// Returns `true` if the app should quit.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        // Review input overlay intercepts everything when open.
+        if self.review_overlay.is_some() {
+            return self.handle_key_review_overlay(code, mods);
+        }
+
         // Theme picker intercepts everything when open.
         if self.show_theme_picker {
             return self.handle_key_theme_picker(code);
@@ -234,8 +406,87 @@ impl App {
         }
     }
 
-    fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {
+    fn handle_key_review_overlay(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        // Ctrl+Enter submits; Esc cancels; everything else edits the buffer.
+        if mods.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char('m') | KeyCode::Enter = code {
+                self.submit_review_overlay();
+                return false;
+            }
+        }
+
         match code {
+            KeyCode::Esc => {
+                self.review_overlay = None;
+            }
+            KeyCode::Enter => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.insert_newline();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.backspace();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.move_right();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.move_down();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(overlay) = self.review_overlay.as_mut() {
+                    overlay.insert_char(ch);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Validate and submit the current review overlay.
+    fn submit_review_overlay(&mut self) {
+        let Some(overlay) = &mut self.review_overlay else { return };
+
+        let body = overlay.body();
+        if overlay.action.body_required() && body.trim().is_empty() {
+            overlay.error = Some("A comment is required for this review type".to_string());
+            return;
+        }
+
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return };
+        let pr_number = pr.number;
+        let Some(repo) = self.repo.clone() else { return };
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+        let event = overlay.action.event_str().to_string();
+
+        tokio::spawn(async move {
+            match gh.submit_review(&repo.owner, &repo.name, pr_number, &event, &body).await {
+                Ok(()) => { let _ = tx.send(BgMsg::ReviewSubmitted); }
+                Err(e) => { let _ = tx.send(BgMsg::ReviewError(format!("{:#}", e))); }
+            }
+        });
+
+        self.review_overlay = None;
+    }
+
+    fn handle_key_theme_picker(&mut self, code: KeyCode) -> bool {        match code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.theme_picker_cursor + 1 < ALL_THEMES.len() {
                     self.theme_picker_cursor += 1;
@@ -557,6 +808,21 @@ impl App {
                 self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
                 self.show_theme_picker = true;
             }
+            KeyCode::Char('A') => {
+                self.g_pending = false;
+                self.status_message = None;
+                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::Approve));
+            }
+            KeyCode::Char('R') => {
+                self.g_pending = false;
+                self.status_message = None;
+                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::RequestChanges));
+            }
+            KeyCode::Char('C') => {
+                self.g_pending = false;
+                self.status_message = None;
+                self.review_overlay = Some(ReviewOverlayState::new(ReviewAction::Comment));
+            }
             _ => {
                 // Any unrecognised key clears the g-pending state.
                 self.g_pending = false;
@@ -684,6 +950,14 @@ impl App {
             }
             BgMsg::CheckRunsError(e) => {
                 self.check_runs_load_state = LoadState::Error(e);
+            }
+            BgMsg::ReviewSubmitted => {
+                self.status_message = Some("Review submitted successfully".to_string());
+                // Refresh review decisions so the badge updates immediately
+                self.fetch_review_decisions();
+            }
+            BgMsg::ReviewError(e) => {
+                self.status_message = Some(format!("Review error: {e}"));
             }
         }
     }
