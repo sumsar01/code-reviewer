@@ -1,6 +1,6 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
-use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, ReviewComment, parse_diff};
+use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, RepoSearchResult, ReviewComment, parse_diff};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
@@ -16,6 +16,23 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+
+// ── Timing / UI constants ─────────────────────────────────────────────────────
+
+/// How long a status-bar message stays visible before being cleared.
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
+
+/// Poll interval for keyboard events, giving ~60 fps.
+const TICK_RATE: Duration = Duration::from_millis(16);
+
+/// Debounce delay before firing a repository search after the last keystroke.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Maximum number of repository search results requested per query.
+const SEARCH_PAGE_SIZE: u8 = 8;
+
+/// Initial/fallback height used for the diff area before the first render.
+const DEFAULT_DIFF_AREA_HEIGHT: u16 = 24;
 
 // ── State enums ───────────────────────────────────────────────────────────────
 
@@ -220,6 +237,70 @@ pub enum LoadState {
     Error(String),
 }
 
+/// State for the loading/result tracking inside the repo switcher.
+#[derive(Debug, Clone)]
+pub enum SearchState {
+    /// Nothing happening (query empty / not yet triggered).
+    Idle,
+    /// A search request is in-flight.
+    Loading,
+    /// Results are ready (possibly empty).
+    Done,
+    /// The search API returned an error.
+    Error(String),
+}
+
+/// All state for the repo-switcher overlay.
+#[derive(Debug, Clone)]
+pub struct RepoSwitcherState {
+    /// The text the user has typed so far.
+    pub query: String,
+    /// Search results from the GitHub API.
+    pub results: Vec<RepoSearchResult>,
+    /// Which suggestion row is highlighted (0-indexed).
+    pub cursor: usize,
+    /// State of the background search.
+    pub search_state: SearchState,
+    /// Recent repos snapshot (copied from config when the overlay opens).
+    pub recent_repos: Vec<String>,
+    /// Debounce: time of the last query change. We fire a search 300 ms after
+    /// the user stops typing.
+    pub last_keystroke: Option<Instant>,
+}
+
+impl RepoSwitcherState {
+    pub fn new(recent_repos: Vec<String>) -> Self {
+        Self {
+            query: String::new(),
+            results: Vec::new(),
+            cursor: 0,
+            search_state: SearchState::Idle,
+            recent_repos,
+            last_keystroke: None,
+        }
+    }
+
+    /// Return the `owner/name` string for the currently highlighted suggestion,
+    /// or `None` if there's nothing to select.
+    pub fn selected_full_name(&self) -> Option<String> {
+        if self.query.is_empty() {
+            self.recent_repos.get(self.cursor).cloned()
+        } else {
+            let r = self.results.get(self.cursor)?;
+            Some(format!("{}/{}", r.owner, r.name))
+        }
+    }
+
+    /// Number of currently visible suggestion rows.
+    pub fn suggestion_count(&self) -> usize {
+        if self.query.is_empty() {
+            self.recent_repos.len()
+        } else {
+            self.results.len()
+        }
+    }
+}
+
 // ── Background task messages ──────────────────────────────────────────────────
 
 enum BgMsg {
@@ -244,6 +325,12 @@ enum BgMsg {
     UpdateCompleted,
     /// The `cargo install` update failed; contains the error message.
     UpdateFailed(String),
+    /// Repo search results are ready.
+    RepoSearchResults(Vec<RepoSearchResult>),
+    /// Repo search failed.
+    RepoSearchError(String),
+    /// A new GitHubClient authenticated for a different owner is ready.
+    GithubClientReady(Arc<GitHubClient>),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -306,6 +393,8 @@ pub struct App {
     pub update_available: Option<String>,
     /// True while `cargo install` is running in the background during an update.
     pub update_in_progress: bool,
+    /// Active repo-switcher overlay state (None when not shown).
+    pub repo_switcher: Option<RepoSwitcherState>,
 
     tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -360,7 +449,7 @@ impl App {
             diff_file_cursor: 0,
             diff_line_cursor: 0,
             diff_load_state: LoadState::Idle,
-            last_diff_area_height: 24,
+            last_diff_area_height: DEFAULT_DIFF_AREA_HEIGHT,
             pr_comments: Vec::new(),
             comments_scroll: 0,
             comments_load_state: LoadState::Idle,
@@ -378,6 +467,7 @@ impl App {
             status_message: None,
             update_available: None,
             update_in_progress: false,
+            repo_switcher: None,
             tx,
             rx,
         };
@@ -398,16 +488,19 @@ impl App {
                 self.handle_bg_msg(msg);
             }
 
-            // Expire stale status messages after 3 seconds.
-            if matches!(&self.status_message, Some((_, t)) if t.elapsed() > Duration::from_secs(3)) {
+            // Debounce repo search: fire search 300 ms after the last keystroke.
+            self.tick_repo_search_debounce();
+
+            // Expire stale status messages after STATUS_MESSAGE_TTL.
+            if matches!(&self.status_message, Some((_, t)) if t.elapsed() > STATUS_MESSAGE_TTL) {
                 self.status_message = None;
             }
 
             // Draw
             terminal.draw(|f| ui::render(f, self))?;
 
-            // Poll for keyboard event (16ms → ~60fps)
-            if event::poll(Duration::from_millis(16))? {
+            // Poll for keyboard event (~60fps)
+            if event::poll(TICK_RATE)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         if self.handle_key(key.code, key.modifiers) {
@@ -436,6 +529,11 @@ impl App {
         // Review input overlay intercepts everything when open.
         if self.review_overlay.is_some() {
             return self.handle_key_review_overlay(code, mods);
+        }
+
+        // Repo-switcher overlay intercepts everything when open.
+        if self.repo_switcher.is_some() {
+            return self.handle_key_repo_switcher(code, mods);
         }
 
         // Comment peek overlay: any key closes it.
@@ -477,45 +575,25 @@ impl App {
             }
         }
 
+        // Esc closes the overlay without needing a mutable borrow of its contents.
+        if code == KeyCode::Esc {
+            self.review_overlay = None;
+            return false;
+        }
+
+        // All remaining keys mutate the overlay buffer — bail early if there is none.
+        let Some(overlay) = self.review_overlay.as_mut() else {
+            return false;
+        };
+
         match code {
-            KeyCode::Esc => {
-                self.review_overlay = None;
-            }
-            KeyCode::Enter => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.insert_newline();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.backspace();
-                }
-            }
-            KeyCode::Left => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.move_left();
-                }
-            }
-            KeyCode::Right => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.move_right();
-                }
-            }
-            KeyCode::Up => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.move_up();
-                }
-            }
-            KeyCode::Down => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.move_down();
-                }
-            }
-            KeyCode::Char(ch) => {
-                if let Some(overlay) = self.review_overlay.as_mut() {
-                    overlay.insert_char(ch);
-                }
-            }
+            KeyCode::Enter => overlay.insert_newline(),
+            KeyCode::Backspace => overlay.backspace(),
+            KeyCode::Left => overlay.move_left(),
+            KeyCode::Right => overlay.move_right(),
+            KeyCode::Up => overlay.move_up(),
+            KeyCode::Down => overlay.move_down(),
+            KeyCode::Char(ch) => overlay.insert_char(ch),
             _ => {}
         }
         false
@@ -638,6 +716,99 @@ impl App {
         false
     }
 
+    fn handle_key_repo_switcher(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        // ── Ctrl+W — delete last word ────────────────────────────────────────
+        if mods.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char('w') = code {
+                if let Some(state) = self.repo_switcher.as_mut() {
+                    let q = &mut state.query;
+                    // Trim trailing spaces then pop until the previous word boundary
+                    // (space or '/') so `ctrl+w` over "rust-lang/rust" backs to "rust-lang/".
+                    while q.ends_with(' ') { q.pop(); }
+                    while !q.is_empty() && !q.ends_with('/') && !q.ends_with(' ') { q.pop(); }
+                    state.cursor = 0;
+                    state.results.clear();
+                    if q.is_empty() {
+                        state.search_state = SearchState::Idle;
+                    } else {
+                        state.search_state = SearchState::Loading;
+                        state.last_keystroke = Some(Instant::now());
+                    }
+                }
+                return false;
+            }
+        }
+
+        let Some(state) = self.repo_switcher.as_mut() else {
+            return false;
+        };
+
+        match code {
+            KeyCode::Esc => {
+                self.repo_switcher = None;
+            }
+            KeyCode::Enter => {
+                let query = self
+                    .repo_switcher
+                    .as_ref()
+                    .map(|s| s.query.trim().to_string())
+                    .unwrap_or_default();
+
+                // If the query looks like "owner/repo" already, switch directly
+                // without requiring a search result to be selected.
+                let target = if looks_like_full_name(&query) {
+                    Some(query)
+                } else {
+                    self.repo_switcher.as_ref().and_then(|s| s.selected_full_name())
+                };
+
+                if let Some(full_name) = target {
+                    self.repo_switcher = None;
+                    self.switch_repo(&full_name);
+                }
+            }
+            KeyCode::Tab => {
+                // Fill the input with the currently highlighted suggestion so
+                // the user can refine it before confirming.
+                if let Some(name) = state.selected_full_name() {
+                    state.query = name;
+                    state.cursor = 0;
+                    state.results.clear();
+                    state.search_state = SearchState::Loading;
+                    state.last_keystroke = Some(Instant::now());
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = state.suggestion_count();
+                if count > 0 && state.cursor + 1 < count {
+                    state.cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.cursor = state.cursor.saturating_sub(1);
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.cursor = 0;
+                state.results.clear();
+                if state.query.is_empty() {
+                    state.search_state = SearchState::Idle;
+                } else {
+                    state.search_state = SearchState::Loading;
+                    state.last_keystroke = Some(Instant::now());
+                }
+            }
+            KeyCode::Char(ch) => {
+                state.query.push(ch);
+                state.cursor = 0;
+                state.search_state = SearchState::Loading;
+                state.last_keystroke = Some(Instant::now());
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn handle_key_list(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
@@ -675,6 +846,10 @@ impl App {
                 self.theme_picker_original = Some(self.theme.clone());
                 self.theme_picker_cursor = Theme::index_of(&self.config.ui.theme);
                 self.show_theme_picker = true;
+            }
+            KeyCode::Char('/') => {
+                let recent = self.config.ui.recent_repos.clone();
+                self.repo_switcher = Some(RepoSwitcherState::new(recent));
             }
             _ => {}
         }
@@ -1159,10 +1334,123 @@ impl App {
                 self.update_available = None;
                 self.status_message = Some((format!("Update failed: {e}"), Instant::now()));
             }
+            BgMsg::RepoSearchResults(results) => {
+                if let Some(state) = self.repo_switcher.as_mut() {
+                    state.results = results;
+                    state.search_state = SearchState::Done;
+                    state.cursor = 0;
+                }
+            }
+            BgMsg::RepoSearchError(e) => {
+                if let Some(state) = self.repo_switcher.as_mut() {
+                    state.search_state = SearchState::Error(e);
+                    state.results.clear();
+                }
+            }
+            BgMsg::GithubClientReady(client) => {
+                // Swap in the new authenticated client, then re-fetch PRs with it.
+                self.github = client;
+                self.prs = Vec::new();
+                self.pr_load_state = LoadState::Loading;
+                self.fetch_prs();
+            }
         }
     }
 
     // ── Async task launchers ──────────────────────────────────────────────────
+
+    /// Fire a repo search in the background if the debounce window has elapsed.
+    fn tick_repo_search_debounce(&mut self) {
+        let should_fire = self
+            .repo_switcher
+            .as_ref()
+            .and_then(|s| s.last_keystroke)
+            .map(|t| t.elapsed() >= SEARCH_DEBOUNCE)
+            .unwrap_or(false);
+
+        if should_fire {
+            if let Some(state) = self.repo_switcher.as_mut() {
+                // Clear the debounce timer so we don't re-fire on the next tick.
+                state.last_keystroke = None;
+            }
+            let query = self
+                .repo_switcher
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default();
+            if !query.is_empty() {
+                self.search_repos_bg(query);
+            }
+        }
+    }
+
+    /// Spawn a background task to search GitHub repos for `query`.
+    fn search_repos_bg(&self, query: String) {
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match gh.search_repos(&query, SEARCH_PAGE_SIZE).await {
+                Ok(results) => {
+                    let _ = tx.send(BgMsg::RepoSearchResults(results));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::RepoSearchError(format!("{:#}", e)));
+                }
+            }
+        });
+    }
+
+    /// Switch the active repo to `full_name` ("owner/name"), re-authenticate if
+    /// needed, persist to recent history, and trigger a fresh PR load.
+    fn switch_repo(&mut self, full_name: &str) {
+        let mut parts = full_name.splitn(2, '/');
+        let owner = match parts.next() {
+            Some(o) if !o.is_empty() => o.to_string(),
+            _ => return,
+        };
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => return,
+        };
+
+        // Detect whether the owner is changing — if so, we need a new token.
+        let owner_changed = self
+            .repo
+            .as_ref()
+            .map(|r| !r.owner.eq_ignore_ascii_case(&owner))
+            .unwrap_or(true);
+
+        // Update the active repo (no local workdir — it wasn't checked out here).
+        self.repo = Some(RepoInfo { owner: owner.clone(), name: name.clone(), workdir: None });
+
+        // Persist to recent repos history.
+        self.config.ui.push_recent_repo(&owner, &name);
+
+        // Reset the PR list state.
+        self.prs = Vec::new();
+        self.pr_cursor = 0;
+        self.pr_load_state = LoadState::Loading;
+
+        if owner_changed {
+            // Kick off a background re-auth for the new owner.  When the new
+            // client arrives via BgMsg::GithubClientReady it will re-fetch PRs
+            // with the correct token.  We also do a speculative fetch with the
+            // current token — if the new repo is public it will work immediately.
+            self.reauth_for_owner(owner);
+        }
+        self.fetch_prs();
+    }
+
+    /// Spawn a background task that authenticates for `owner` and sends back a
+    /// ready-to-use `GitHubClient` via `BgMsg::GithubClientReady`.
+    fn reauth_for_owner(&self, owner: String) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Ok(client) = GitHubClient::new_for_owner(&owner).await {
+                let _ = tx.send(BgMsg::GithubClientReady(Arc::new(client)));
+            }
+        });
+    }
 
     /// Spawn a background task that checks the GitHub Releases API for a newer
     /// version.  The result arrives via `BgMsg::UpdateAvailable`.
@@ -1450,16 +1738,19 @@ impl App {
         let owner = repo.owner.clone();
         let repo_name = repo.name.clone();
 
-        let (file_cursor, total_files) = match self.detail_tab {
-            DetailTab::Diff => (self.diff_file_cursor, self.diff_files.len()),
-            DetailTab::Difftastic => (self.difft_file_cursor, self.difft_files.len()),
+        // Resolve current file cursor, total file count, and filename in one match.
+        let (file_cursor, total_files, filename) = match self.detail_tab {
+            DetailTab::Diff => (
+                self.diff_file_cursor,
+                self.diff_files.len(),
+                self.diff_files.get(self.diff_file_cursor).map(|f| f.filename.clone()),
+            ),
+            DetailTab::Difftastic => (
+                self.difft_file_cursor,
+                self.difft_files.len(),
+                self.difft_files.get(self.difft_file_cursor).map(|(n, _)| n.clone()),
+            ),
             DetailTab::Comments => return,
-        };
-
-        let filename = match self.detail_tab {
-            DetailTab::Diff => self.diff_files.get(file_cursor).map(|f| f.filename.clone()),
-            DetailTab::Difftastic => self.difft_files.get(file_cursor).map(|(n, _)| n.clone()),
-            DetailTab::Comments => None,
         };
         let Some(filename) = filename else { return };
 
@@ -1513,9 +1804,22 @@ impl App {
     fn save_config(&mut self) {
         if let Some(repo) = &self.repo {
             self.config.ui.last_repo = Some(repo.full_name());
+            self.config.ui.push_recent_repo(&repo.owner.clone(), &repo.name.clone());
         }
         let _ = config::save(&self.config);
     }
+}
+
+// ── Repo switcher helpers ─────────────────────────────────────────────────────
+
+/// Returns `true` when `s` looks like a complete "owner/repo" slug:
+/// exactly one `/`, non-empty on both sides, no further slashes.
+fn looks_like_full_name(s: &str) -> bool {
+    let mut parts = s.splitn(3, '/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    let extra = parts.next();
+    !owner.is_empty() && !repo.is_empty() && extra.is_none()
 }
 
 // ── Difftastic output parser ──────────────────────────────────────────────────

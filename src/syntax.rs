@@ -5,6 +5,7 @@
 //! a filename and a slice of source lines to get back a `Vec` of per-line
 //! span data that `diff.rs` turns into ratatui `Span`s.
 
+use tree_sitter::Language;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 // ── Highlight capture names ───────────────────────────────────────────────────
@@ -89,175 +90,147 @@ pub struct SyntaxHighlighter {
     configs: Vec<(Vec<String>, HighlightConfiguration)>,
 }
 
+/// Descriptor for a single language grammar used to build highlight configs.
+struct LangSpec {
+    /// Display name passed to [`HighlightConfiguration::new`].
+    name: &'static str,
+    /// File extensions that map to this language.
+    exts: &'static [&'static str],
+    /// The tree-sitter language.
+    language: Language,
+    /// The highlights query string.
+    highlights: &'static str,
+    /// The injections query string (empty string if none).
+    injections: &'static str,
+    /// The locals query string (empty string if none).
+    locals: &'static str,
+}
+
 impl SyntaxHighlighter {
     pub fn new() -> Self {
-        let mut configs: Vec<(Vec<String>, HighlightConfiguration)> = Vec::new();
-
-        // ── Rust ──────────────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-            tree_sitter_rust::INJECTIONS_QUERY,
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["rs".into()], cfg));
-        }
-
-        // ── Python ────────────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_python::LANGUAGE.into(),
-            "python",
-            tree_sitter_python::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["py".into(), "pyi".into()], cfg));
-        }
-
-        // ── JavaScript ───────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
+        // Build the TypeScript / TSX highlight queries by prepending the TS-specific
+        // captures before the shared JS captures so that TS rules take priority.
+        let ts_highlights: String = format!(
+            "{}\n{}",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
             tree_sitter_javascript::HIGHLIGHT_QUERY,
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((
-                vec!["js".into(), "mjs".into(), "cjs".into(), "jsx".into()],
-                cfg,
-            ));
-        }
+        );
+        let tsx_highlights: String = ts_highlights.clone();
 
-        // ── TypeScript ───────────────────────────────────────────────────────
-        // tree-sitter-typescript's HIGHLIGHTS_QUERY only covers TS-specific tokens
-        // (types, TS keywords).  It has no @function captures at all.  We must
-        // prepend the JS highlights so that functions, variables, operators, etc.
-        // are picked up.  TS rules come first so they take priority over JS where
-        // the two overlap (e.g. `string`/`number` → type.builtin, not keyword).
-        {
-            let ts_highlights = format!(
-                "{}\n{}",
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-            );
+        let specs: Vec<LangSpec> = vec![
+            LangSpec {
+                name: "rust",
+                exts: &["rs"],
+                language: tree_sitter_rust::LANGUAGE.into(),
+                highlights: tree_sitter_rust::HIGHLIGHTS_QUERY,
+                injections: tree_sitter_rust::INJECTIONS_QUERY,
+                locals: "",
+            },
+            LangSpec {
+                name: "python",
+                exts: &["py", "pyi"],
+                language: tree_sitter_python::LANGUAGE.into(),
+                highlights: tree_sitter_python::HIGHLIGHTS_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "javascript",
+                exts: &["js", "mjs", "cjs", "jsx"],
+                language: tree_sitter_javascript::LANGUAGE.into(),
+                highlights: tree_sitter_javascript::HIGHLIGHT_QUERY,
+                injections: tree_sitter_javascript::INJECTIONS_QUERY,
+                locals: tree_sitter_javascript::LOCALS_QUERY,
+            },
+            LangSpec {
+                name: "go",
+                exts: &["go"],
+                language: tree_sitter_go::LANGUAGE.into(),
+                highlights: tree_sitter_go::HIGHLIGHTS_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "c",
+                exts: &["c", "h"],
+                language: tree_sitter_c::LANGUAGE.into(),
+                highlights: tree_sitter_c::HIGHLIGHT_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "cpp",
+                exts: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+                language: tree_sitter_cpp::LANGUAGE.into(),
+                highlights: tree_sitter_cpp::HIGHLIGHT_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "json",
+                exts: &["json"],
+                language: tree_sitter_json::LANGUAGE.into(),
+                highlights: tree_sitter_json::HIGHLIGHTS_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "bash",
+                exts: &["sh", "bash", "zsh", "fish"],
+                language: tree_sitter_bash::LANGUAGE.into(),
+                highlights: tree_sitter_bash::HIGHLIGHT_QUERY,
+                injections: "",
+                locals: "",
+            },
+            LangSpec {
+                name: "toml",
+                exts: &["toml"],
+                language: tree_sitter_toml_ng::LANGUAGE.into(),
+                highlights: tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+                injections: "",
+                locals: "",
+            },
+        ];
+
+        let mut configs: Vec<(Vec<String>, HighlightConfiguration)> =
+            Vec::with_capacity(specs.len() + 2);
+
+        // Register all simple (non-composed) languages.
+        for spec in specs {
             if let Ok(mut cfg) = HighlightConfiguration::new(
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                "typescript",
-                &ts_highlights,
-                "",
-                tree_sitter_typescript::LOCALS_QUERY,
+                spec.language.clone(),
+                spec.name,
+                spec.highlights,
+                spec.injections,
+                spec.locals,
             ) {
                 cfg.configure(HIGHLIGHT_NAMES);
-                configs.push((vec!["ts".into()], cfg));
+                configs.push((spec.exts.iter().map(|e| (*e).into()).collect(), cfg));
             }
         }
 
-        // ── TSX ───────────────────────────────────────────────────────────────
-        {
-            let tsx_highlights = format!(
-                "{}\n{}",
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-            );
-            if let Ok(mut cfg) = HighlightConfiguration::new(
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                "tsx",
-                &tsx_highlights,
-                "",
-                tree_sitter_typescript::LOCALS_QUERY,
-            ) {
-                cfg.configure(HIGHLIGHT_NAMES);
-                configs.push((vec!["tsx".into()], cfg));
-            }
-        }
-
-        // ── Go ────────────────────────────────────────────────────────────────
+        // TypeScript — composed highlights (TS rules + JS rules).
         if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_go::LANGUAGE.into(),
-            "go",
-            tree_sitter_go::HIGHLIGHTS_QUERY,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            &ts_highlights,
             "",
-            "",
+            tree_sitter_typescript::LOCALS_QUERY,
         ) {
             cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["go".into()], cfg));
+            configs.push((vec!["ts".into()], cfg));
         }
 
-        // ── C ─────────────────────────────────────────────────────────────────
+        // TSX — same composed highlights, TSX language.
         if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_c::LANGUAGE.into(),
-            "c",
-            tree_sitter_c::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            &tsx_highlights,
             "",
-            "",
+            tree_sitter_typescript::LOCALS_QUERY,
         ) {
             cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["c".into(), "h".into()], cfg));
-        }
-
-        // ── C++ ───────────────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
-            tree_sitter_cpp::HIGHLIGHT_QUERY,
-            "",
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((
-                vec![
-                    "cpp".into(),
-                    "cc".into(),
-                    "cxx".into(),
-                    "hpp".into(),
-                    "hh".into(),
-                    "hxx".into(),
-                ],
-                cfg,
-            ));
-        }
-
-        // ── JSON ──────────────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_json::LANGUAGE.into(),
-            "json",
-            tree_sitter_json::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["json".into()], cfg));
-        }
-
-        // ── Bash / Shell ──────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_bash::LANGUAGE.into(),
-            "bash",
-            tree_sitter_bash::HIGHLIGHT_QUERY,
-            "",
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((
-                vec!["sh".into(), "bash".into(), "zsh".into(), "fish".into()],
-                cfg,
-            ));
-        }
-
-        // ── TOML ──────────────────────────────────────────────────────────────
-        if let Ok(mut cfg) = HighlightConfiguration::new(
-            tree_sitter_toml_ng::LANGUAGE.into(),
-            "toml",
-            tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ) {
-            cfg.configure(HIGHLIGHT_NAMES);
-            configs.push((vec!["toml".into()], cfg));
+            configs.push((vec!["tsx".into()], cfg));
         }
 
         Self { configs }

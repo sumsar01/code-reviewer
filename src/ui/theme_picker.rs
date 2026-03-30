@@ -1,5 +1,9 @@
 use crate::app::App;
-use crate::ui::theme::{Theme, ALL_THEMES};
+use crate::ui::{
+    constants::THEME_PICKER_WIDTH,
+    theme::{Theme, ALL_THEMES},
+    utils::render_hint_bar,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -65,26 +69,13 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     // ── Status bar ────────────────────────────────────────────────────────────
     let hints: &[(&str, &str)] = &[("j/k", "navigate"), ("Enter", "apply"), ("Esc", "cancel")];
-
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", t.text_dim_style()));
-        }
-        spans.push(Span::styled(format!(" {key} "), t.key_badge_style()));
-        spans.push(Span::styled(format!(" {desc}"), t.key_desc_style()));
-    }
-
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(t.background_style()),
-        chunks[1],
-    );
+    render_hint_bar(f, hints, chunks[1], t);
 }
 
-/// Compute a centered rect for the picker: 36 cols wide, auto-height.
+/// Compute a centered rect for the picker: THEME_PICKER_WIDTH cols wide, auto-height.
 fn picker_rect(r: Rect) -> Rect {
     let height = (ALL_THEMES.len() + 4) as u16; // entries + border + padding + statusbar
-    let width = 36u16;
+    let width = THEME_PICKER_WIDTH;
 
     let vert = Layout::default()
         .direction(Direction::Vertical)

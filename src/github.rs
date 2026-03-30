@@ -4,6 +4,22 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Command;
 
+/// Number of pull requests fetched per page when listing a repository's PRs.
+const PR_LIST_PAGE_SIZE: u8 = 50;
+
+/// Hard cap on GitHub repository search results per query.
+const REPO_SEARCH_MAX_RESULTS: u8 = 10;
+
+/// A lightweight repo search result.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RepoSearchResult {
+    pub owner: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub stars: u32,
+}
+
 /// A GitHub pull request (subset of fields we care about).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -154,7 +170,7 @@ impl GitHubClient {
             .pulls(owner, repo)
             .list()
             .state(octocrab::params::State::Open)
-            .per_page(50)
+            .per_page(PR_LIST_PAGE_SIZE)
             .send()
             .await
             .with_context(|| format!("Listing PRs for {owner}/{repo}"))?;
@@ -437,6 +453,53 @@ impl GitHubClient {
             })?;
 
         Ok(())
+    }
+
+    /// Search GitHub repositories matching `query`.
+    /// Returns up to `per_page` results (max 10).
+    pub async fn search_repos(&self, query: &str, per_page: u8) -> Result<Vec<RepoSearchResult>> {
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            items: Vec<SearchItem>,
+        }
+        #[derive(Deserialize)]
+        struct SearchItem {
+            full_name: String,
+            description: Option<String>,
+            stargazers_count: u32,
+        }
+
+        let per_page = per_page.min(REPO_SEARCH_MAX_RESULTS);
+        let resp: SearchResponse = self
+            .octo
+            .get(
+                "/search/repositories",
+                Some(&[
+                    ("q", query),
+                    ("per_page", &per_page.to_string()),
+                    ("sort", "stars"),
+                ]),
+            )
+            .await
+            .with_context(|| format!("Searching repositories for {:?}", query))?;
+
+        let results = resp
+            .items
+            .into_iter()
+            .filter_map(|item| {
+                let mut parts = item.full_name.splitn(2, '/');
+                let owner = parts.next()?.to_string();
+                let name = parts.next()?.to_string();
+                Some(RepoSearchResult {
+                    owner,
+                    name,
+                    description: item.description,
+                    stars: item.stargazers_count,
+                })
+            })
+            .collect();
+
+        Ok(results)
     }
 
     /// Fetch CI check results for a specific commit SHA.

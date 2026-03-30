@@ -1,7 +1,11 @@
 use crate::app::{App, DetailFocus, LoadState};
 use crate::github::{DiffFile, DiffLineKind, ReviewComment};
 use crate::syntax::SyntaxHighlighter;
-use crate::ui::{file_tree, theme::Theme};
+use crate::ui::{
+    constants::{SPLIT_THRESHOLD, TREE_WIDTH},
+    file_tree,
+    theme::Theme,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -9,10 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-
-const SPLIT_THRESHOLD: u16 = 160;
-/// Width of the file-tree sidebar in columns.
-const TREE_WIDTH: u16 = 36;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, t: &Theme, hl: &SyntaxHighlighter) {
     match &app.diff_load_state {
@@ -482,6 +482,51 @@ fn render_side_by_side(
     f.render_widget(right_p, chunks[1]);
 }
 
+/// Build a single side's span list for one diff line.
+///
+/// * `no_str`      – pre-formatted line-number + sigil prefix (e.g. `" 123 + "`)
+/// * `prefix_fg`   – foreground color for the gutter/prefix
+/// * `effective_bg`– background for the whole line (solid color or `None` for default)
+/// * `content_fg`  – default foreground for highlighted text
+/// * `content`     – raw line content
+/// * `line_hl`     – syntax-highlight spans for this line
+/// * `comment_no`  – if `Some((lineno, side))`, append a dot marker when the line has a comment
+/// * `commented`   – the full set of commented (lineno, side) pairs
+fn build_diff_line_spans(
+    no_str: String,
+    prefix_fg: Color,
+    effective_bg: Option<Color>,
+    content_fg: Color,
+    content: &str,
+    line_hl: &[crate::syntax::HlSpan],
+    comment_check: Option<(u64, &str)>,
+    commented: &std::collections::HashSet<(u64, &str)>,
+    t: &Theme,
+) -> Vec<Span<'static>> {
+    let prefix_style = match effective_bg {
+        Some(bg) => Style::default().fg(prefix_fg).bg(bg),
+        None => Style::default().fg(prefix_fg),
+    };
+    let mut spans = vec![Span::styled(no_str, prefix_style)];
+    spans.extend(spans_for_content(
+        content,
+        line_hl,
+        effective_bg,
+        content_fg,
+        t,
+    ));
+    if let Some((lineno, side)) = comment_check {
+        if commented.contains(&(lineno, side)) {
+            let marker_bg = effective_bg.unwrap_or(t.background);
+            spans.push(Span::styled(
+                " \u{25cf}".to_string(),
+                Style::default().fg(t.text_accent).bg(marker_bg),
+            ));
+        }
+    }
+    spans
+}
+
 fn build_side_by_side_lines(
     file: &DiffFile,
     t: &Theme,
@@ -499,6 +544,16 @@ fn build_side_by_side_lines(
         .filter(|c| c.path.as_deref() == Some(&file.filename))
         .filter_map(|c| c.line.map(|ln| (ln, "RIGHT")))
         .collect();
+
+    /// Resolve syntax-highlight spans for a specific source + index table entry.
+    macro_rules! resolve_hl {
+        ($hl_data:expr, $idx_table:expr, $hi:expr, $li:expr) => {
+            match (&$hl_data, $idx_table[$hi][$li]) {
+                (Some(data), Some(idx)) if idx < data.len() => data[idx].as_slice(),
+                _ => &[],
+            }
+        };
+    }
 
     let mut left: Vec<Line<'static>> = Vec::new();
     let mut right: Vec<Line<'static>> = Vec::new();
@@ -523,103 +578,89 @@ fn build_side_by_side_lines(
         for (line_i, dl) in hunk.lines.iter().enumerate() {
             let is_cursor = row == line_cursor;
             let gutter = if is_cursor { "\u{25b6}" } else { " " };
+            let cursor_fg = if is_cursor {
+                t.text_accent
+            } else {
+                Color::Reset
+            };
 
             match dl.kind {
                 DiffLineKind::Added => {
-                    let effective_bg = if is_cursor {
+                    let bg = Some(if is_cursor {
                         t.selection_bg
                     } else {
                         t.diff_added_bg
+                    });
+                    let fg = if is_cursor {
+                        cursor_fg
+                    } else {
+                        t.diff_added_fg
                     };
-                    left.push(Line::from(""));
-
                     let no_str = format!(
                         "{}{:>4} + ",
                         gutter,
                         dl.right_no.map(|n| n.to_string()).unwrap_or_default()
                     );
-                    let gutter_fg = if is_cursor {
-                        t.text_accent
-                    } else {
-                        t.diff_added_fg
-                    };
-                    let prefix_style = Style::default().fg(gutter_fg).bg(effective_bg);
-                    let mut spans = vec![Span::styled(no_str, prefix_style)];
-                    let line_hl: &[crate::syntax::HlSpan] = match (&new_hl, new_idx[hunk_i][line_i])
-                    {
-                        (Some(data), Some(idx)) if idx < data.len() => &data[idx],
-                        _ => &[],
-                    };
-                    spans.extend(spans_for_content(
+                    let line_hl = resolve_hl!(new_hl, new_idx, hunk_i, line_i);
+                    let comment = dl.right_no.map(|n| (n as u64, "RIGHT"));
+                    left.push(Line::from(""));
+                    right.push(Line::from(build_diff_line_spans(
+                        no_str,
+                        fg,
+                        bg,
+                        t.diff_added_fg,
                         &dl.content,
                         line_hl,
-                        Some(effective_bg),
-                        t.diff_added_fg,
+                        comment,
+                        &commented,
                         t,
-                    ));
-                    // Comment marker
-                    if dl
-                        .right_no
-                        .map(|n| commented.contains(&(n as u64, "RIGHT")))
-                        .unwrap_or(false)
-                    {
-                        spans.push(Span::styled(
-                            " \u{25cf}".to_string(),
-                            Style::default().fg(t.text_accent).bg(effective_bg),
-                        ));
-                    }
-                    right.push(Line::from(spans));
+                    )));
                 }
                 DiffLineKind::Removed => {
-                    let effective_bg = if is_cursor {
+                    let bg = Some(if is_cursor {
                         t.selection_bg
                     } else {
                         t.diff_removed_bg
+                    });
+                    let fg = if is_cursor {
+                        cursor_fg
+                    } else {
+                        t.diff_removed_fg
                     };
                     let no_str = format!(
                         "{}{:>4} - ",
                         gutter,
                         dl.left_no.map(|n| n.to_string()).unwrap_or_default()
                     );
-                    let gutter_fg = if is_cursor {
-                        t.text_accent
-                    } else {
-                        t.diff_removed_fg
-                    };
-                    let prefix_style = Style::default().fg(gutter_fg).bg(effective_bg);
-                    let mut spans = vec![Span::styled(no_str, prefix_style)];
-                    let line_hl: &[crate::syntax::HlSpan] = match (&old_hl, old_idx[hunk_i][line_i])
-                    {
-                        (Some(data), Some(idx)) if idx < data.len() => &data[idx],
-                        _ => &[],
-                    };
-                    spans.extend(spans_for_content(
+                    let line_hl = resolve_hl!(old_hl, old_idx, hunk_i, line_i);
+                    let comment = dl.left_no.map(|n| (n as u64, "LEFT"));
+                    left.push(Line::from(build_diff_line_spans(
+                        no_str,
+                        fg,
+                        bg,
+                        t.diff_removed_fg,
                         &dl.content,
                         line_hl,
-                        Some(effective_bg),
-                        t.diff_removed_fg,
+                        comment,
+                        &commented,
                         t,
-                    ));
-                    // Comment marker (LEFT side)
-                    if dl
-                        .left_no
-                        .map(|n| commented.contains(&(n as u64, "LEFT")))
-                        .unwrap_or(false)
-                    {
-                        spans.push(Span::styled(
-                            " \u{25cf}".to_string(),
-                            Style::default().fg(t.text_accent).bg(effective_bg),
-                        ));
-                    }
-                    left.push(Line::from(spans));
+                    )));
                     right.push(Line::from(""));
                 }
                 DiffLineKind::Context => {
-                    let effective_bg_opt: Option<Color> = if is_cursor {
+                    let bg: Option<Color> = if is_cursor {
                         Some(t.selection_bg)
                     } else {
                         None
                     };
+                    let fg = if is_cursor { cursor_fg } else { t.diff_context };
+                    let no_style = match bg {
+                        Some(b) => Style::default().fg(fg).bg(b),
+                        None => Style::default().fg(t.diff_context),
+                    };
+                    // Context lines are the same on both sides; use new_hl.
+                    let line_hl = resolve_hl!(new_hl, new_idx, hunk_i, line_i);
+
                     let lno_str = format!(
                         "{}{:>4}   ",
                         gutter,
@@ -630,53 +671,29 @@ fn build_side_by_side_lines(
                         gutter,
                         dl.right_no.map(|n| n.to_string()).unwrap_or_default()
                     );
-                    let gutter_fg = if is_cursor {
-                        t.text_accent
-                    } else {
-                        t.diff_context
-                    };
-                    let no_style = match effective_bg_opt {
-                        Some(bg) => Style::default().fg(gutter_fg).bg(bg),
-                        None => Style::default().fg(t.diff_context),
-                    };
-                    // Context lines are the same on both sides; use new_hl.
-                    let line_hl: &[crate::syntax::HlSpan] = match (&new_hl, new_idx[hunk_i][line_i])
-                    {
-                        (Some(data), Some(idx)) if idx < data.len() => &data[idx],
-                        _ => &[],
-                    };
 
                     let mut lspans = vec![Span::styled(lno_str, no_style)];
                     lspans.extend(spans_for_content(
                         &dl.content,
                         line_hl,
-                        effective_bg_opt,
+                        bg,
                         t.diff_context,
                         t,
                     ));
                     left.push(Line::from(lspans));
 
-                    let mut rspans = vec![Span::styled(rno_str, no_style)];
-                    rspans.extend(spans_for_content(
+                    let r_comment = dl.right_no.map(|n| (n as u64, "RIGHT"));
+                    right.push(Line::from(build_diff_line_spans(
+                        rno_str,
+                        fg,
+                        bg,
+                        t.diff_context,
                         &dl.content,
                         line_hl,
-                        effective_bg_opt,
-                        t.diff_context,
+                        r_comment,
+                        &commented,
                         t,
-                    ));
-                    // Comment marker for context lines (right side)
-                    if dl
-                        .right_no
-                        .map(|n| commented.contains(&(n as u64, "RIGHT")))
-                        .unwrap_or(false)
-                    {
-                        let marker_bg = effective_bg_opt.unwrap_or(t.background);
-                        rspans.push(Span::styled(
-                            " \u{25cf}".to_string(),
-                            Style::default().fg(t.text_accent).bg(marker_bg),
-                        ));
-                    }
-                    right.push(Line::from(rspans));
+                    )));
                 }
             }
             row += 1;

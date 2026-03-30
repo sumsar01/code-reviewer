@@ -1,15 +1,18 @@
 pub mod comment_peek;
 pub mod comments;
+pub mod constants;
 pub mod diff;
 pub mod difftastic;
 pub mod file_tree;
 pub mod help;
 pub mod pr_detail;
 pub mod pr_list;
+pub mod repo_switcher;
 pub mod review_input;
 pub mod theme;
 pub mod theme_picker;
 pub mod update_prompt;
+pub mod utils;
 
 use crate::app::{App, Screen};
 use ratatui::Frame;
@@ -40,5 +43,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.update_available.is_some() {
         update_prompt::render(f, app, &t);
+    }
+
+    if app.repo_switcher.is_some() {
+        repo_switcher::render(f, app, &t);
     }
 }
