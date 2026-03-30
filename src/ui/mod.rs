@@ -9,6 +9,7 @@ pub mod pr_list;
 pub mod review_input;
 pub mod theme;
 pub mod theme_picker;
+pub mod update_prompt;
 
 use crate::app::{App, Screen};
 use ratatui::Frame;
@@ -35,5 +36,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.comment_peek.is_some() {
         comment_peek::render(f, app, &t);
+    }
+
+    if app.update_available.is_some() {
+        update_prompt::render(f, app, &t);
     }
 }

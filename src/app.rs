@@ -4,6 +4,7 @@ use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, R
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::{Theme, ALL_THEMES};
+use crate::updater;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -12,7 +13,7 @@ use std::{
     io,
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -237,6 +238,12 @@ enum BgMsg {
     ReviewError(String),
     InlineCommentSubmitted,
     InlineCommentError(String),
+    /// A newer GitHub Release is available; contains the new tag string (e.g. `"v0.2.0"`).
+    UpdateAvailable(String),
+    /// The `cargo install` update finished successfully.
+    UpdateCompleted,
+    /// The `cargo install` update failed; contains the error message.
+    UpdateFailed(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -293,7 +300,12 @@ pub struct App {
     /// Read-only comment peek overlay: shows existing comments on the cursor diff line.
     pub comment_peek: Option<Vec<ReviewComment>>,
     /// Transient status message shown in the status bar (e.g. "Review submitted").
-    pub status_message: Option<String>,
+    /// Carries the time it was set so it can auto-expire after a few seconds.
+    pub status_message: Option<(String, Instant)>,
+    /// Some(tag) when a newer GitHub Release has been detected; drives the update prompt overlay.
+    pub update_available: Option<String>,
+    /// True while `cargo install` is running in the background during an update.
+    pub update_in_progress: bool,
 
     tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -364,12 +376,16 @@ impl App {
             review_overlay: None,
             comment_peek: None,
             status_message: None,
+            update_available: None,
+            update_in_progress: false,
             tx,
             rx,
         };
 
         // Kick off initial PR load
         app.fetch_prs();
+        // Kick off background update check (silent on failure)
+        app.check_for_update();
         Ok(app)
     }
 
@@ -380,6 +396,11 @@ impl App {
             // Drain background messages
             while let Ok(msg) = self.rx.try_recv() {
                 self.handle_bg_msg(msg);
+            }
+
+            // Expire stale status messages after 3 seconds.
+            if matches!(&self.status_message, Some((_, t)) if t.elapsed() > Duration::from_secs(3)) {
+                self.status_message = None;
             }
 
             // Draw
@@ -406,6 +427,12 @@ impl App {
 
     /// Returns `true` if the app should quit.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        // Update prompt intercepts y/n/Esc when active (but not while the
+        // install is already running — no accidental double-trigger).
+        if self.update_available.is_some() && !self.update_in_progress {
+            return self.handle_key_update_prompt(code);
+        }
+
         // Review input overlay intercepts everything when open.
         if self.review_overlay.is_some() {
             return self.handle_key_review_overlay(code, mods);
@@ -545,6 +572,40 @@ impl App {
                     }
                 });
             }
+        }
+    }
+
+    /// Handle keypresses when the update-available prompt is visible.
+    /// Returns `true` if the app should quit (it won't — we return false always
+    /// here and let the app stay alive until the user relaunches after update).
+    fn handle_key_update_prompt(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let tag = match self.update_available.clone() {
+                    Some(t) => t,
+                    None => return false,
+                };
+                self.update_in_progress = true;
+                let tx = self.tx.clone();
+                // Run the blocking `cargo install` on a dedicated thread so it
+                // doesn't stall the tokio executor.
+                tokio::task::spawn_blocking(move || {
+                    match crate::updater::perform_update(&tag) {
+                        Ok(()) => {
+                            let _ = tx.send(BgMsg::UpdateCompleted);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(BgMsg::UpdateFailed(e));
+                        }
+                    }
+                });
+                false
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.update_available = None;
+                false
+            }
+            _ => false,
         }
     }
 
@@ -917,9 +978,10 @@ impl App {
                             ReviewAction::InlineComment { path, line, side },
                         ));
                     } else {
-                        self.status_message = Some(
+                        self.status_message = Some((
                             "Cursor is on a hunk header — move to a diff line first".to_string(),
-                        );
+                            Instant::now(),
+                        ));
                     }
                 }
             }
@@ -1063,15 +1125,15 @@ impl App {
                 self.check_runs_load_state = LoadState::Error(e);
             }
             BgMsg::ReviewSubmitted => {
-                self.status_message = Some("Review submitted successfully".to_string());
+                self.status_message = Some(("Review submitted successfully".to_string(), Instant::now()));
                 // Refresh review decisions so the badge updates immediately
                 self.fetch_review_decisions();
             }
             BgMsg::ReviewError(e) => {
-                self.status_message = Some(format!("Review error: {e}"));
+                self.status_message = Some((format!("Review error: {e}"), Instant::now()));
             }
             BgMsg::InlineCommentSubmitted => {
-                self.status_message = Some("Inline comment posted".to_string());
+                self.status_message = Some(("Inline comment posted".to_string(), Instant::now()));
                 // Re-fetch comments so the new one appears in the Comments tab
                 if let Some(pr) = self.prs.get(self.pr_cursor) {
                     let pr_number = pr.number;
@@ -1079,12 +1141,39 @@ impl App {
                 }
             }
             BgMsg::InlineCommentError(e) => {
-                self.status_message = Some(format!("Comment error: {e}"));
+                self.status_message = Some((format!("Comment error: {e}"), Instant::now()));
+            }
+            BgMsg::UpdateAvailable(tag) => {
+                self.update_available = Some(tag);
+            }
+            BgMsg::UpdateCompleted => {
+                self.update_in_progress = false;
+                self.update_available = None;
+                self.status_message = Some((
+                    "Update complete! Relaunch prr to use the new version.".to_string(),
+                    Instant::now(),
+                ));
+            }
+            BgMsg::UpdateFailed(e) => {
+                self.update_in_progress = false;
+                self.update_available = None;
+                self.status_message = Some((format!("Update failed: {e}"), Instant::now()));
             }
         }
     }
 
     // ── Async task launchers ──────────────────────────────────────────────────
+
+    /// Spawn a background task that checks the GitHub Releases API for a newer
+    /// version.  The result arrives via `BgMsg::UpdateAvailable`.
+    fn check_for_update(&self) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Some(tag) = updater::check_for_update().await {
+                let _ = tx.send(BgMsg::UpdateAvailable(tag));
+            }
+        });
+    }
 
     fn fetch_prs(&self) {
         let Some(repo) = self.repo.clone() else { return };
