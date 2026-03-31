@@ -125,11 +125,9 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
             // Description subtitle (dimmed, truncated to fit width)
             if let Some(d) = desc {
                 let max_w = area.width.saturating_sub(6) as usize;
-                let truncated = if d.len() > max_w {
-                    format!("{}…", &d[..max_w.saturating_sub(1)])
-                } else {
-                    d.clone()
-                };
+                // Use Unicode-aware truncation so multi-byte characters (e.g.
+                // Chinese, emoji) don't cause a panic from a mid-codepoint byte slice.
+                let truncated = truncate_str(&d, max_w);
                 lines.push(Line::from(Span::styled(
                     format!("    {truncated}"),
                     t.text_dim_style(),
@@ -179,6 +177,96 @@ fn visible_suggestions(state: &RepoSwitcherState) -> Vec<(String, Option<String>
             })
             .collect()
     }
+}
+
+/// Truncate `s` to at most `max_display_cols` terminal columns, appending "…"
+/// when the string is shortened.  Uses Unicode character count as a proxy for
+/// display width (good enough for CJK; a full wcwidth implementation would
+/// require an extra dep).  Crucially, it never slices mid-codepoint.
+fn truncate_str(s: &str, max_display_cols: usize) -> String {
+    if max_display_cols == 0 {
+        return String::new();
+    }
+    let mut col = 0usize;
+    let mut last_safe_byte = 0usize;
+    for (byte_pos, ch) in s.char_indices() {
+        let ch_width = unicode_display_width(ch);
+        if col + ch_width > max_display_cols.saturating_sub(1) {
+            // Would overflow — truncate here and append ellipsis.
+            return format!("{}…", &s[..last_safe_byte]);
+        }
+        col += ch_width;
+        last_safe_byte = byte_pos + ch.len_utf8();
+    }
+    // String fits entirely.
+    s.to_string()
+}
+
+/// Returns the approximate terminal display width for a single Unicode character.
+/// Wide characters (CJK Unified Ideographs, Hangul, fullwidth forms, etc.) return 2;
+/// combining/zero-width characters return 0; everything else returns 1.
+fn unicode_display_width(ch: char) -> usize {
+    let cp = ch as u32;
+    if cp == 0 {
+        return 0;
+    }
+    // Combining / zero-width ranges
+    if (0x0300..=0x036F).contains(&cp) {
+        return 0;
+    }
+    if (0x1DC0..=0x1DFF).contains(&cp) {
+        return 0;
+    }
+    if (0x20D0..=0x20FF).contains(&cp) {
+        return 0;
+    }
+    if (0xFE20..=0xFE2F).contains(&cp) {
+        return 0;
+    }
+    // Wide ranges
+    if (0x1100..=0x115F).contains(&cp) {
+        return 2;
+    } // Hangul Jamo
+    if (0x2E80..=0x303E).contains(&cp) {
+        return 2;
+    } // CJK Radicals / misc
+    if (0x3040..=0x33FF).contains(&cp) {
+        return 2;
+    } // Japanese / CJK compat
+    if (0x3400..=0x4DBF).contains(&cp) {
+        return 2;
+    } // CJK Extension A
+    if (0x4E00..=0x9FFF).contains(&cp) {
+        return 2;
+    } // CJK Unified Ideographs
+    if (0xA000..=0xA4CF).contains(&cp) {
+        return 2;
+    } // Yi
+    if (0xA960..=0xA97F).contains(&cp) {
+        return 2;
+    } // Hangul Jamo Extended-A
+    if (0xAC00..=0xD7FF).contains(&cp) {
+        return 2;
+    } // Hangul Syllables
+    if (0xF900..=0xFAFF).contains(&cp) {
+        return 2;
+    } // CJK Compat Ideographs
+    if (0xFE10..=0xFE1F).contains(&cp) {
+        return 2;
+    } // Vertical forms
+    if (0xFE30..=0xFE4F).contains(&cp) {
+        return 2;
+    } // CJK Compat Forms
+    if (0xFF01..=0xFF60).contains(&cp) {
+        return 2;
+    } // Fullwidth
+    if (0xFFE0..=0xFFE6).contains(&cp) {
+        return 2;
+    } // Fullwidth signs
+    if cp >= 0x1B000 {
+        return 2;
+    } // Emoji / supplemental CJK
+    1
 }
 
 fn format_stars(n: u32) -> String {

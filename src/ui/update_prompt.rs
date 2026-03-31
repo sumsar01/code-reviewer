@@ -1,7 +1,8 @@
 //! Update-available prompt overlay.
 //!
 //! Shown when the background update check finds a newer GitHub Release.
-//! The user can press [y] to install the update or [n]/Esc to dismiss.
+//! The user can press [y] to confirm the update (exits the TUI and runs
+//! `cargo install` in a clean terminal) or [n]/Esc to dismiss.
 
 use crate::app::App;
 use crate::ui::{theme::Theme, utils::centered_rect};
@@ -40,25 +41,17 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     lines.push(Line::from(""));
 
-    if app.update_in_progress {
-        lines.push(Line::from(Span::styled(
-            "  Updating… this may take a minute.",
-            Style::default()
-                .fg(t.text_accent)
-                .add_modifier(Modifier::ITALIC),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Please wait.",
-            t.key_desc_style(),
-        )));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  [y] ", t.key_badge_style()),
-            Span::styled("Update now    ", t.key_desc_style()),
-            Span::styled("[n] ", t.key_badge_style()),
-            Span::styled("Skip", t.key_desc_style()),
-        ]));
-    }
+    lines.push(Line::from(vec![
+        Span::styled("  [y] ", t.key_badge_style()),
+        Span::styled("Update now    ", t.key_desc_style()),
+        Span::styled("[n] ", t.key_badge_style()),
+        Span::styled("Skip", t.key_desc_style()),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        "  (exits prr, then runs cargo install)",
+        t.text_dim_style(),
+    )));
 
     lines.push(Line::from(""));
 

@@ -48,5 +48,24 @@ async fn main() -> Result<()> {
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new().await?;
-    app.run(terminal).await
+    app.run(terminal).await?;
+
+    // If the user confirmed an update, perform it now — outside the TUI so
+    // cargo's output goes directly to the terminal without corrupting the UI.
+    if app.update_confirmed {
+        if let Some(tag) = &app.update_available.clone() {
+            println!("\nUpdating prr to {tag} via cargo install…\n");
+            match updater::perform_update(tag) {
+                Ok(()) => {
+                    println!("\nUpdate complete! Run `prr` to start the new version.");
+                }
+                Err(e) => {
+                    eprintln!("\nUpdate failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

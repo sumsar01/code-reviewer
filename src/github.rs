@@ -455,9 +455,40 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Return the list of organisation login names the authenticated user belongs to.
+    /// Returns an empty vec on any error (best-effort; never blocks the app).
+    pub async fn fetch_user_orgs(&self) -> Vec<String> {
+        #[derive(Deserialize)]
+        struct OrgItem {
+            login: String,
+        }
+
+        let result: Result<Vec<OrgItem>, _> = self
+            .octo
+            .get("/user/orgs", Some(&[("per_page", "100")]))
+            .await;
+
+        match result {
+            Ok(orgs) => orgs.into_iter().map(|o| o.login).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Search GitHub repositories matching `query`.
+    ///
+    /// When `org_hints` is non-empty the query is biased so that repos owned
+    /// by those orgs (or the authenticated user) rank higher in results.
+    /// GitHub's search API supports `org:` qualifiers which limit OR-match to
+    /// the supplied orgs without excluding global results when combined with a
+    /// plain keyword — so we append them to the query string.
+    ///
     /// Returns up to `per_page` results (max 10).
-    pub async fn search_repos(&self, query: &str, per_page: u8) -> Result<Vec<RepoSearchResult>> {
+    pub async fn search_repos(
+        &self,
+        query: &str,
+        per_page: u8,
+        org_hints: &[String],
+    ) -> Result<Vec<RepoSearchResult>> {
         #[derive(Deserialize)]
         struct SearchResponse {
             items: Vec<SearchItem>,
@@ -469,13 +500,27 @@ impl GitHubClient {
             stargazers_count: u32,
         }
 
+        // Build biased query: append "org:<name>" for each known org plus the
+        // authenticated user so personal repos also bubble up.
+        let biased_query = if org_hints.is_empty() {
+            query.to_string()
+        } else {
+            let org_qualifiers: String = org_hints
+                .iter()
+                .map(|o| format!(" org:{o}"))
+                .collect::<Vec<_>>()
+                .join("");
+            // Also include the authenticated user so personal repos rank highly.
+            format!("{query} user:{}{org_qualifiers}", self.username)
+        };
+
         let per_page = per_page.min(REPO_SEARCH_MAX_RESULTS);
         let resp: SearchResponse = self
             .octo
             .get(
                 "/search/repositories",
                 Some(&[
-                    ("q", query),
+                    ("q", biased_query.as_str()),
                     ("per_page", &per_page.to_string()),
                     ("sort", "stars"),
                 ]),

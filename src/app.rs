@@ -321,14 +321,12 @@ pub(crate) enum BgMsg {
     InlineCommentError(String),
     /// A newer GitHub Release is available; contains the new tag string (e.g. `"v0.2.0"`).
     UpdateAvailable(String),
-    /// The `cargo install` update finished successfully.
-    UpdateCompleted,
-    /// The `cargo install` update failed; contains the error message.
-    UpdateFailed(String),
     /// Repo search results are ready.
     RepoSearchResults(Vec<RepoSearchResult>),
     /// Repo search failed.
     RepoSearchError(String),
+    /// User org list fetched at startup (used to bias repo search queries).
+    UserOrgsLoaded(Vec<String>),
     /// A new GitHubClient authenticated for a different owner is ready.
     GithubClientReady(Arc<GitHubClient>),
 }
@@ -393,8 +391,14 @@ pub struct App {
     pub update_available: Option<String>,
     /// True while `cargo install` is running in the background during an update.
     pub update_in_progress: bool,
+    /// Set to true when the user confirms an update (presses y).
+    /// The run loop exits, the TUI is torn down, and main.rs performs the update.
+    pub update_confirmed: bool,
     /// Active repo-switcher overlay state (None when not shown).
     pub repo_switcher: Option<RepoSwitcherState>,
+    /// Organisations the authenticated user belongs to (fetched at startup).
+    /// Used to bias the repo search query with `org:` qualifiers.
+    pub user_orgs: Vec<String>,
 
     pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -467,7 +471,9 @@ impl App {
             status_message: None,
             update_available: None,
             update_in_progress: false,
+            update_confirmed: false,
             repo_switcher: None,
+            user_orgs: Vec::new(),
             tx,
             rx,
         };
@@ -476,6 +482,8 @@ impl App {
         app.fetch_prs();
         // Kick off background update check (silent on failure)
         app.check_for_update();
+        // Fetch the user's orgs so search queries can be biased toward them.
+        app.fetch_user_orgs();
         Ok(app)
     }
 
@@ -718,19 +726,6 @@ impl App {
             BgMsg::UpdateAvailable(tag) => {
                 self.update_available = Some(tag);
             }
-            BgMsg::UpdateCompleted => {
-                self.update_in_progress = false;
-                self.update_available = None;
-                self.status_message = Some((
-                    "Update complete! Relaunch prr to use the new version.".to_string(),
-                    Instant::now(),
-                ));
-            }
-            BgMsg::UpdateFailed(e) => {
-                self.update_in_progress = false;
-                self.update_available = None;
-                self.status_message = Some((format!("Update failed: {e}"), Instant::now()));
-            }
             BgMsg::RepoSearchResults(results) => {
                 if let Some(state) = self.repo_switcher.as_mut() {
                     state.results = results;
@@ -744,12 +739,17 @@ impl App {
                     state.results.clear();
                 }
             }
+            BgMsg::UserOrgsLoaded(orgs) => {
+                self.user_orgs = orgs;
+            }
             BgMsg::GithubClientReady(client) => {
                 // Swap in the new authenticated client, then re-fetch PRs with it.
                 self.github = client;
                 self.prs = Vec::new();
                 self.pr_load_state = LoadState::Loading;
                 self.fetch_prs();
+                // Re-fetch orgs for the new account so search stays biased correctly.
+                self.fetch_user_orgs();
             }
         }
     }
@@ -785,8 +785,9 @@ impl App {
     fn search_repos_bg(&self, query: String) {
         let gh = Arc::clone(&self.github);
         let tx = self.tx.clone();
+        let org_hints = self.user_orgs.clone();
         tokio::spawn(async move {
-            match gh.search_repos(&query, SEARCH_PAGE_SIZE).await {
+            match gh.search_repos(&query, SEARCH_PAGE_SIZE, &org_hints).await {
                 Ok(results) => {
                     let _ = tx.send(BgMsg::RepoSearchResults(results));
                 }
@@ -846,6 +847,18 @@ impl App {
             if let Ok(client) = GitHubClient::new_for_owner(&owner).await {
                 let _ = tx.send(BgMsg::GithubClientReady(Arc::new(client)));
             }
+        });
+    }
+
+    /// Spawn a background task to fetch the authenticated user's GitHub orgs.
+    /// Results arrive via `BgMsg::UserOrgsLoaded` and are stored in `user_orgs`
+    /// so that subsequent repo searches can be biased with `org:` qualifiers.
+    fn fetch_user_orgs(&self) {
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let orgs = gh.fetch_user_orgs().await;
+            let _ = tx.send(BgMsg::UserOrgsLoaded(orgs));
         });
     }
 

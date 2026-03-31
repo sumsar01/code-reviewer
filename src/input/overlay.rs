@@ -1,4 +1,4 @@
-use crate::app::{App, BgMsg, SearchState};
+use crate::app::{App, SearchState};
 use crate::ui::theme::{Theme, ALL_THEMES};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::Arc;
@@ -46,23 +46,10 @@ pub fn handle_key_review_overlay(app: &mut App, code: KeyCode, mods: KeyModifier
 pub fn handle_key_update_prompt(app: &mut App, code: KeyCode) -> bool {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            let tag = match app.update_available.clone() {
-                Some(t) => t,
-                None => return false,
-            };
-            app.update_in_progress = true;
-            let tx = app.tx.clone();
-            // Run the blocking `cargo install` on a dedicated thread so it
-            // doesn't stall the tokio executor.
-            tokio::task::spawn_blocking(move || match crate::updater::perform_update(&tag) {
-                Ok(()) => {
-                    let _ = tx.send(BgMsg::UpdateCompleted);
-                }
-                Err(e) => {
-                    let _ = tx.send(BgMsg::UpdateFailed(e));
-                }
-            });
-            false
+            // Signal that the user confirmed the update.  Returning `true` causes
+            // the run loop to exit so the TUI is torn down before cargo runs.
+            app.update_confirmed = true;
+            true // exit run loop
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.update_available = None;
