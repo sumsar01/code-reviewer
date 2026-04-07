@@ -230,9 +230,12 @@ name = "code-reviewer"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "crossterm",
  "dirs-next",
  "git2",
+ "http",
+ "http-body-util",
  "octocrab",
  "open",
  "ratatui",

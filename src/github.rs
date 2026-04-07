@@ -233,12 +233,45 @@ impl GitHubClient {
     }
 
     /// Fetch the unified diff for a PR as a string.
+    ///
+    /// Uses lossy UTF-8 conversion so that PRs touching binary files (images,
+    /// compiled artifacts, etc.) do not fail with `InvalidUtf8` – any
+    /// non-UTF-8 bytes are replaced with the Unicode replacement character
+    /// (U+FFFD) instead of returning an error.
     pub async fn pr_diff(&self, owner: &str, repo: &str, pr_number: u64) -> Result<String> {
-        self.octo
-            .pulls(owner, repo)
-            .get_diff(pr_number)
+        use http::Method;
+        use http_body_util::BodyExt as _;
+
+        let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}");
+        let uri = http::Uri::builder()
+            .path_and_query(route)
+            .build()
+            .context("building diff URI")?;
+
+        let builder = http::request::Builder::new()
+            .method(Method::GET)
+            .uri(uri)
+            .header(http::header::ACCEPT, "application/vnd.github.diff");
+
+        let request = self
+            .octo
+            .build_request(builder, None::<&()>)
+            .context("building diff request")?;
+
+        let response = self
+            .octo
+            .execute(request)
             .await
-            .with_context(|| format!("Fetching diff for PR #{pr_number}"))
+            .with_context(|| format!("Fetching diff for PR #{pr_number}"))?;
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .context("reading diff response body")?
+            .to_bytes();
+
+        Ok(String::from_utf8_lossy(&body_bytes).into_owned())
     }
 
     /// Fetch review comments for a PR.
