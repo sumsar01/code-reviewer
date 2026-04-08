@@ -1,6 +1,6 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
-use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, RepoSearchResult, ReviewComment, parse_diff};
+use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, ReviewRequestPr, RepoSearchResult, ReviewComment, parse_diff};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::Theme;
@@ -212,6 +212,7 @@ impl ReviewOverlayState {
 pub enum Screen {
     PrList,
     PrDetail,
+    ReviewRequests,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +330,14 @@ pub(crate) enum BgMsg {
     UserOrgsLoaded(Vec<String>),
     /// A new GitHubClient authenticated for a different owner is ready.
     GithubClientReady(Arc<GitHubClient>),
+    /// Cross-repo review-requested PRs loaded.
+    ReviewRequestPrsLoaded(Vec<ReviewRequestPr>),
+    /// Failed to load review-requested PRs.
+    ReviewRequestPrsError(String),
+    /// A single PR fetched by owner/repo/number (used when jumping from review-requests screen).
+    SinglePrLoaded(PullRequest),
+    /// Failed to fetch a single PR.
+    SinglePrError(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -399,6 +408,17 @@ pub struct App {
     /// Organisations the authenticated user belongs to (fetched at startup).
     /// Used to bias the repo search query with `org:` qualifiers.
     pub user_orgs: Vec<String>,
+
+    // ── Review Requests screen state ──────────────────────────────────────────
+    /// PRs across all repos where the current user has been requested as reviewer.
+    pub rr_prs: Vec<ReviewRequestPr>,
+    /// Cursor position in the review-requests list.
+    pub rr_cursor: usize,
+    /// Load state for the review-requests list.
+    pub rr_load_state: LoadState,
+    /// When false (default): only direct personal review requests (`@me`).
+    /// When true: includes team review requests (`review-requested:<username>`).
+    pub rr_show_all: bool,
 
     pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -474,6 +494,10 @@ impl App {
             update_confirmed: false,
             repo_switcher: None,
             user_orgs: Vec::new(),
+            rr_prs: Vec::new(),
+            rr_cursor: 0,
+            rr_load_state: LoadState::Idle,
+            rr_show_all: false,
             tx,
             rx,
         };
@@ -564,6 +588,7 @@ impl App {
         match &self.screen {
             Screen::PrList => self.handle_key_list(code),
             Screen::PrDetail => self.handle_key_detail(code, mods),
+            Screen::ReviewRequests => self.handle_key_review_requests(code),
         }
     }
 
@@ -646,6 +671,10 @@ impl App {
 
     fn handle_key_detail(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         crate::input::detail::handle_key_detail(self, code, mods)
+    }
+
+    fn handle_key_review_requests(&mut self, code: KeyCode) -> bool {
+        crate::input::review_requests::handle_key_review_requests(self, code)
     }
 
     // ── Background message handler ────────────────────────────────────────────
@@ -750,6 +779,25 @@ impl App {
                 self.fetch_prs();
                 // Re-fetch orgs for the new account so search stays biased correctly.
                 self.fetch_user_orgs();
+            }
+            BgMsg::ReviewRequestPrsLoaded(prs) => {
+                self.rr_prs = prs;
+                self.rr_load_state = LoadState::Idle;
+            }
+            BgMsg::ReviewRequestPrsError(e) => {
+                self.rr_load_state = LoadState::Error(e);
+            }
+            BgMsg::SinglePrLoaded(pr) => {
+                // A full PR was fetched after the user selected one from the
+                // review-requests screen.  Push it as the current PR and open detail.
+                self.prs = vec![pr];
+                self.pr_cursor = 0;
+                self.pr_load_state = LoadState::Idle;
+                self.open_detail();
+            }
+            BgMsg::SinglePrError(e) => {
+                self.status_message = Some((format!("Could not load PR: {e}"), Instant::now()));
+                self.rr_load_state = LoadState::Idle;
             }
         }
     }
@@ -883,6 +931,62 @@ impl App {
             match gh.list_prs(&repo.owner, &repo.name, mine_only).await {
                 Ok(prs) => { let _ = tx.send(BgMsg::PrsLoaded(prs)); }
                 Err(e) => { let _ = tx.send(BgMsg::PrsError(format!("{:#}", e))); }
+            }
+        });
+    }
+
+    /// Fetch all open PRs where the current user has been requested as a reviewer,
+    /// across all repos, using the GitHub search API.
+    pub fn fetch_review_request_prs(&self) {
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+        let direct_only = !self.rr_show_all;
+
+        tokio::spawn(async move {
+            match gh.fetch_review_requested_prs(direct_only).await {
+                Ok(prs) => { let _ = tx.send(BgMsg::ReviewRequestPrsLoaded(prs)); }
+                Err(e) => { let _ = tx.send(BgMsg::ReviewRequestPrsError(format!("{:#}", e))); }
+            }
+        });
+    }
+
+    /// Fetch a single full PR (needed when jumping from the review-requests screen
+    /// into the PR detail view, since the search API only returns lightweight data).
+    /// Switches the active repo to `owner/name` before fetching, re-authing if the
+    /// owner is different from the current one.
+    pub fn open_review_request_pr(&mut self, owner: String, name: String, number: u64, url: String) {
+        let owner_changed = self
+            .repo
+            .as_ref()
+            .map(|r| !r.owner.eq_ignore_ascii_case(&owner))
+            .unwrap_or(true);
+
+        // Update active repo (no local workdir — it may not be checked out).
+        self.repo = Some(crate::git::RepoInfo { owner: owner.clone(), name: name.clone(), workdir: None });
+        self.config.ui.push_recent_repo(&owner, &name);
+
+        // Show a transient status while loading.
+        self.status_message = Some(("Loading PR…".to_string(), Instant::now()));
+
+        let gh = Arc::clone(&self.github);
+        let tx = self.tx.clone();
+
+        if owner_changed {
+            // Re-auth in background; when done, SinglePrLoaded will follow.
+            // Also do a speculative immediate fetch — works for same-org/public repos.
+            self.reauth_for_owner(owner.clone());
+        }
+
+        tokio::spawn(async move {
+            match gh.fetch_single_pr(&owner, &name, number).await {
+                Ok(pr) => { let _ = tx.send(BgMsg::SinglePrLoaded(pr)); }
+                Err(_) => {
+                    // On failure, fall back to opening the URL in the browser.
+                    let _ = open::that(&url);
+                    let _ = tx.send(BgMsg::SinglePrError(
+                        format!("Could not fetch PR #{number} — opened in browser instead")
+                    ));
+                }
             }
         });
     }

@@ -7,6 +7,9 @@ use std::process::Command;
 /// Number of pull requests fetched per page when listing a repository's PRs.
 const PR_LIST_PAGE_SIZE: u8 = 50;
 
+/// Number of review-request search results fetched per page.
+const REVIEW_REQUEST_PAGE_SIZE: u8 = 50;
+
 /// Hard cap on GitHub repository search results per query.
 const REPO_SEARCH_MAX_RESULTS: u8 = 10;
 
@@ -18,6 +21,22 @@ pub struct RepoSearchResult {
     pub name: String,
     pub description: Option<String>,
     pub stars: u32,
+}
+
+/// A cross-repo PR where the authenticated user has been requested as a reviewer.
+/// Sourced from GitHub's `/search/issues` endpoint (`is:pr is:open review-requested:ME`).
+/// Lighter than `PullRequest` — no SHAs or file stats, because the search API
+/// returns `Issue` objects rather than full PR objects.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ReviewRequestPr {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub url: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub draft: bool,
 }
 
 /// A GitHub pull request (subset of fields we care about).
@@ -230,6 +249,136 @@ impl GitHubClient {
         }
 
         Ok(prs)
+    }
+
+    /// Fetch all open PRs across all repos where the authenticated user has been
+    /// requested as a reviewer, using the GitHub search API.
+    ///
+    /// When `direct_only` is true (the default), uses `review-requested:@me` which
+    /// matches only direct personal requests — team review requests are excluded.
+    /// When false, uses `review-requested:<username>` which includes PRs requested
+    /// via any GitHub team the user belongs to.
+    pub async fn fetch_review_requested_prs(&self, direct_only: bool) -> Result<Vec<ReviewRequestPr>> {
+        // GitHub's search API returns `Issue` objects for both issues and PRs.
+        // The `pull_request` field is present (and non-null) when the item is a PR.
+        #[derive(Deserialize)]
+        struct SearchPage {
+            items: Vec<SearchIssue>,
+        }
+        #[derive(Deserialize)]
+        struct SearchIssue {
+            number: u64,
+            title: String,
+            html_url: String,
+            user: Option<SearchUser>,
+            pull_request: Option<serde_json::Value>, // present iff it's a PR
+            draft: Option<bool>,
+            repository_url: String, // "https://api.github.com/repos/owner/name"
+        }
+        #[derive(Deserialize)]
+        struct SearchUser {
+            login: String,
+        }
+
+        let reviewer = if direct_only { "@me".to_string() } else { self.username.clone() };
+        let query = format!("is:pr is:open review-requested:{reviewer}");
+        let mut prs: Vec<ReviewRequestPr> = Vec::new();
+        let mut page_num: u32 = 1;
+
+        loop {
+            let resp: SearchPage = self
+                .octo
+                .get(
+                    "/search/issues",
+                    Some(&[
+                        ("q", query.as_str()),
+                        ("per_page", &REVIEW_REQUEST_PAGE_SIZE.to_string()),
+                        ("page", &page_num.to_string()),
+                    ]),
+                )
+                .await
+                .with_context(|| format!("Searching review-requested PRs for {}", self.username))?;
+
+            let count = resp.items.len();
+
+            for issue in resp.items {
+                // Skip non-PRs (shouldn't happen given `is:pr`, but be safe)
+                if issue.pull_request.is_none() {
+                    continue;
+                }
+
+                // Parse owner/name from "https://api.github.com/repos/owner/name"
+                let (repo_owner, repo_name) = parse_repository_url(&issue.repository_url);
+
+                prs.push(ReviewRequestPr {
+                    number: issue.number,
+                    title: issue.title,
+                    author: issue.user.map(|u| u.login).unwrap_or_default(),
+                    url: issue.html_url,
+                    repo_owner,
+                    repo_name,
+                    draft: issue.draft.unwrap_or(false),
+                });
+            }
+
+            // Stop paginating when we received fewer items than the page size
+            if count < REVIEW_REQUEST_PAGE_SIZE as usize {
+                break;
+            }
+            page_num += 1;
+        }
+
+        Ok(prs)
+    }
+
+    /// Fetch a single PR by owner, repo, and number.
+    /// Returns a fully-populated `PullRequest` (including head/base SHAs needed
+    /// to open the diff view).
+    pub async fn fetch_single_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PullRequest> {
+        let pr = self
+            .octo
+            .pulls(owner, repo)
+            .get(number)
+            .await
+            .with_context(|| format!("Fetching PR #{number} for {owner}/{repo}"))?;
+
+        let author = pr
+            .user
+            .as_ref()
+            .map(|u| u.login.clone())
+            .unwrap_or_default();
+
+        Ok(PullRequest {
+            number: pr.number,
+            title: pr.title.clone().unwrap_or_else(|| "(no title)".to_string()),
+            author,
+            head_branch: pr.head.ref_field.clone(),
+            base_branch: pr.base.ref_field.clone(),
+            head_sha: pr.head.sha.clone(),
+            base_sha: pr.base.sha.clone(),
+            state: pr
+                .state
+                .as_ref()
+                .map(|s| format!("{:?}", s).to_lowercase())
+                .unwrap_or_default(),
+            draft: pr.draft.unwrap_or(false),
+            url: pr
+                .html_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            additions: pr.additions.map(|v| v as i64),
+            deletions: pr.deletions.map(|v| v as i64),
+            changed_files: pr.changed_files.map(|v| v as i64),
+            review_decision: None,
+            ci_status: None,
+            body: pr.body.clone(),
+        })
     }
 
     /// Fetch the unified diff for a PR as a string.
@@ -782,7 +931,20 @@ fn list_gh_accounts() -> Result<Vec<String>> {
     Ok(accounts)
 }
 
-// ── Diff parsing ─────────────────────────────────────────────────────────────
+// ── GitHub URL helpers ────────────────────────────────────────────────────────
+
+/// Parse `"https://api.github.com/repos/owner/name"` into `("owner", "name")`.
+/// Returns empty strings if the URL doesn't match the expected format.
+fn parse_repository_url(url: &str) -> (String, String) {
+    // Strip any trailing slash, then take the last two path segments.
+    let trimmed = url.trim_end_matches('/');
+    let mut parts = trimmed.rsplitn(3, '/');
+    let name = parts.next().unwrap_or("").to_string();
+    let owner = parts.next().unwrap_or("").to_string();
+    (owner, name)
+}
+
+// ── Diff parsing ──────────────────────────────────────────────────────────────
 
 pub fn parse_diff(raw: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();

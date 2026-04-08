@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -202,15 +202,7 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let items: Vec<ListItem> = app
         .prs
         .iter()
-        .enumerate()
-        .map(|(i, pr)| {
-            let selected = i == app.pr_cursor;
-            let base_style = if selected {
-                t.selection_style()
-            } else {
-                Style::default()
-            };
-
+        .map(|pr| {
             let number = format!(" #{:<5}", pr.number);
             let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
             let additions = pr.additions.map(|v| format!("+{v}")).unwrap_or_default();
@@ -237,43 +229,51 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             let mut spans = vec![
                 Span::styled(
                     number,
-                    base_style.fg(t.pr_number).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(t.pr_number)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" ", base_style),
+                Span::raw(" "),
                 Span::styled(
                     format!("{:<width$}", title_display, width = title_width),
-                    base_style.fg(t.text),
+                    Style::default().fg(t.text),
                 ),
             ];
 
             if pr.draft {
                 spans.push(Span::styled(
                     " ▸DRAFT",
-                    base_style.fg(t.pr_draft).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.pr_draft).add_modifier(Modifier::BOLD),
                 ));
             }
 
-            spans.push(Span::styled("  ", base_style));
-            spans.push(Span::styled(author, base_style.fg(t.pr_author)));
-            spans.push(Span::styled("  ", base_style));
-            spans.push(Span::styled(stats, base_style.fg(t.text_dim)));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(author, Style::default().fg(t.pr_author)));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(stats, Style::default().fg(t.text_dim)));
 
             // CI status badge — always renders a fixed-width span so columns align.
             let ci_span = if let Some(state) = pr.ci_status.as_deref() {
                 let (text, color) = ci_badge(state);
                 let padded = format!("{:<width$}", format!("  {text}"), width = CI_COL_WIDTH);
-                Span::styled(padded, base_style.fg(color).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    padded,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )
             } else {
-                Span::styled(" ".repeat(CI_COL_WIDTH), base_style)
+                Span::raw(" ".repeat(CI_COL_WIDTH))
             };
 
             // Review decision badge — always renders a fixed-width span so columns align.
             let review_span = if let Some(decision) = pr.review_decision.as_deref() {
                 let (text, color) = review_badge(decision);
                 let padded = format!("{:<width$}", format!("  {text}"), width = REVIEW_COL_WIDTH);
-                Span::styled(padded, base_style.fg(color).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    padded,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )
             } else {
-                Span::styled(" ".repeat(REVIEW_COL_WIDTH), base_style)
+                Span::raw(" ".repeat(REVIEW_COL_WIDTH))
             };
 
             spans.push(ci_span);
@@ -283,13 +283,19 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(t.border_dim_style())
-            .style(t.background_style()),
-    );
-    f.render_widget(list, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(t.border_dim_style())
+                .style(t.background_style()),
+        )
+        .highlight_style(t.selection_style());
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.pr_cursor));
+
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
@@ -298,6 +304,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("Enter", "open"),
         ("/", "search repo"),
         ("a", "toggle mine/all"),
+        ("R", "review requests"),
         ("r", "refresh"),
         ("o", "browser"),
         ("T", "theme"),
