@@ -416,6 +416,9 @@ pub struct App {
     pub rr_cursor: usize,
     /// Load state for the review-requests list.
     pub rr_load_state: LoadState,
+    /// When false (default): only direct personal review requests (`@me`).
+    /// When true: includes team review requests (`review-requested:<username>`).
+    pub rr_show_all: bool,
 
     pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
@@ -494,6 +497,7 @@ impl App {
             rr_prs: Vec::new(),
             rr_cursor: 0,
             rr_load_state: LoadState::Idle,
+            rr_show_all: false,
             tx,
             rx,
         };
@@ -936,9 +940,10 @@ impl App {
     pub fn fetch_review_request_prs(&self) {
         let gh = Arc::clone(&self.github);
         let tx = self.tx.clone();
+        let direct_only = !self.rr_show_all;
 
         tokio::spawn(async move {
-            match gh.fetch_review_requested_prs().await {
+            match gh.fetch_review_requested_prs(direct_only).await {
                 Ok(prs) => { let _ = tx.send(BgMsg::ReviewRequestPrsLoaded(prs)); }
                 Err(e) => { let _ = tx.send(BgMsg::ReviewRequestPrsError(format!("{:#}", e))); }
             }

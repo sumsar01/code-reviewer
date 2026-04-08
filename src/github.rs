@@ -254,9 +254,11 @@ impl GitHubClient {
     /// Fetch all open PRs across all repos where the authenticated user has been
     /// requested as a reviewer, using the GitHub search API.
     ///
-    /// Uses `is:pr is:open review-requested:<username>` — the same query that
-    /// powers the "Review requests" section on github.com/pulls.
-    pub async fn fetch_review_requested_prs(&self) -> Result<Vec<ReviewRequestPr>> {
+    /// When `direct_only` is true (the default), uses `review-requested:@me` which
+    /// matches only direct personal requests — team review requests are excluded.
+    /// When false, uses `review-requested:<username>` which includes PRs requested
+    /// via any GitHub team the user belongs to.
+    pub async fn fetch_review_requested_prs(&self, direct_only: bool) -> Result<Vec<ReviewRequestPr>> {
         // GitHub's search API returns `Issue` objects for both issues and PRs.
         // The `pull_request` field is present (and non-null) when the item is a PR.
         #[derive(Deserialize)]
@@ -278,7 +280,8 @@ impl GitHubClient {
             login: String,
         }
 
-        let query = format!("is:pr is:open review-requested:{}", self.username);
+        let reviewer = if direct_only { "@me".to_string() } else { self.username.clone() };
+        let query = format!("is:pr is:open review-requested:{reviewer}");
         let mut prs: Vec<ReviewRequestPr> = Vec::new();
         let mut page_num: u32 = 1;
 

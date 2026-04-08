@@ -20,6 +20,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("Review Requests", ""),
     ("j / k", "Navigate up/down"),
     ("Enter", "Open PR for review"),
+    ("a", "Toggle direct requests / all requests"),
     ("o", "Open PR in browser"),
     ("r", "Refresh"),
     ("Esc / q", "Back to PR list"),

@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -43,10 +43,16 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
 
     render_header(f, app, chunks[0], t);
     render_list(f, app, chunks[1], t);
-    render_statusbar(f, chunks[2], t);
+    render_statusbar(f, app, chunks[2], t);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    let filter_label = if app.rr_show_all {
+        "[all requests]"
+    } else {
+        "[direct requests]"
+    };
+
     let line = Line::from(vec![
         Span::styled(
             " prr ",
@@ -56,7 +62,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ),
         Span::styled("  ", Style::default()),
         Span::styled(
-            "[review requests]",
+            filter_label,
             Style::default()
                 .fg(t.pr_number)
                 .add_modifier(Modifier::BOLD),
@@ -128,7 +134,10 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled("Press 'r' to refresh", t.text_dim_style()),
+                Span::styled(
+                    "Press 'r' to refresh, 'a' to toggle direct/all",
+                    t.text_dim_style(),
+                ),
             ]),
         ]);
         let p = Paragraph::new(text).block(block);
@@ -139,21 +148,12 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let items: Vec<ListItem> = app
         .rr_prs
         .iter()
-        .enumerate()
-        .map(|(i, pr)| {
-            let selected = i == app.rr_cursor;
-            let base_style = if selected {
-                t.selection_style()
-            } else {
-                Style::default()
-            };
-
+        .map(|pr| {
             let repo = truncate(
                 &format!("{}/{}", pr.repo_owner, pr.repo_name),
                 COL_REPO_WIDTH,
             );
             let repo_col = format!("{:<width$}", repo, width = COL_REPO_WIDTH);
-
             let number = format!(" #{:<5}", pr.number);
             let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
 
@@ -163,51 +163,65 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 + COL_NUMBER_WIDTH
                 + COL_SEP_WIDTH
                 + COL_AUTHOR_WIDTH
-                + 2; // trailing padding
+                + 2;
             let title_width = inner_width.saturating_sub(fixed);
             let title_display = truncate(&pr.title, title_width);
 
             let mut spans = vec![
-                Span::styled(" ", base_style),
-                Span::styled(repo_col, base_style.fg(t.text_dim)),
+                Span::styled(" ", Style::default()),
+                Span::styled(repo_col, Style::default().fg(t.text_dim)),
                 Span::styled(
                     number,
-                    base_style.fg(t.pr_number).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(t.pr_number)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" ", base_style),
+                Span::styled(" ", Style::default()),
                 Span::styled(
                     format!("{:<width$}", title_display, width = title_width),
-                    base_style.fg(t.text),
+                    Style::default().fg(t.text),
                 ),
             ];
 
             if pr.draft {
                 spans.push(Span::styled(
                     " ▸DRAFT",
-                    base_style.fg(t.pr_draft).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.pr_draft).add_modifier(Modifier::BOLD),
                 ));
             }
 
-            spans.push(Span::styled("  ", base_style));
-            spans.push(Span::styled(author, base_style.fg(t.pr_author)));
+            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::styled(author, Style::default().fg(t.pr_author)));
 
             ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(t.border_dim_style())
-            .style(t.background_style()),
-    );
-    f.render_widget(list, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(t.border_dim_style())
+                .style(t.background_style()),
+        )
+        .highlight_style(t.selection_style());
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.rr_cursor));
+
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
+fn render_statusbar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
+    let filter_hint = if app.rr_show_all {
+        "direct only"
+    } else {
+        "show all"
+    };
     let hints: &[(&str, &str)] = &[
         ("j/k", "navigate"),
         ("Enter", "open PR"),
+        ("a", filter_hint),
         ("o", "browser"),
         ("r", "refresh"),
         ("?", "help"),

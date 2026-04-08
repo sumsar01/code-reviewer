@@ -22,6 +22,12 @@ pub fn handle_key_review_requests(app: &mut App, code: KeyCode) -> bool {
                 app.open_review_request_pr(pr.repo_owner, pr.repo_name, pr.number, pr.url);
             }
         }
+        KeyCode::Char('a') => {
+            app.rr_show_all = !app.rr_show_all;
+            app.rr_cursor = 0;
+            app.rr_load_state = LoadState::Loading;
+            app.fetch_review_request_prs();
+        }
         KeyCode::Char('o') => {
             if let Some(pr) = app.rr_prs.get(app.rr_cursor) {
                 let _ = open::that(&pr.url);
