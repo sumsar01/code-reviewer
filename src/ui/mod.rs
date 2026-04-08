@@ -9,6 +9,7 @@ pub mod pr_detail;
 pub mod pr_list;
 pub mod repo_switcher;
 pub mod review_input;
+pub mod review_requests;
 pub mod theme;
 pub mod theme_picker;
 pub mod update_prompt;
@@ -23,6 +24,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match &app.screen {
         Screen::PrList => pr_list::render(f, app, &t),
         Screen::PrDetail => pr_detail::render(f, app, &t),
+        Screen::ReviewRequests => review_requests::render(f, app, &t),
     }
 
     if app.show_help {

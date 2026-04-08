@@ -298,6 +298,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, t: &Theme) {
         ("Enter", "open"),
         ("/", "search repo"),
         ("a", "toggle mine/all"),
+        ("R", "review requests"),
         ("r", "refresh"),
         ("o", "browser"),
         ("T", "theme"),

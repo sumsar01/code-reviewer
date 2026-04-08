@@ -1,4 +1,4 @@
-use crate::app::{App, LoadState, RepoSwitcherState};
+use crate::app::{App, LoadState, RepoSwitcherState, Screen};
 use crate::ui::theme::Theme;
 use crossterm::event::KeyCode;
 
@@ -29,6 +29,16 @@ pub fn handle_key_list(app: &mut App, code: KeyCode) -> bool {
             app.pr_cursor = 0;
             app.pr_load_state = LoadState::Loading;
             app.fetch_prs();
+        }
+        KeyCode::Char('R') => {
+            // Switch to the cross-repo review requests screen.
+            app.screen = Screen::ReviewRequests;
+            // Fetch only if we haven't already loaded (avoids redundant API calls).
+            if app.rr_prs.is_empty() && !matches!(app.rr_load_state, LoadState::Loading) {
+                app.rr_cursor = 0;
+                app.rr_load_state = LoadState::Loading;
+                app.fetch_review_request_prs();
+            }
         }
         KeyCode::Char('o') => {
             if let Some(pr) = app.prs.get(app.pr_cursor) {
