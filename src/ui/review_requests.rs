@@ -16,6 +16,8 @@ const COL_NUMBER_WIDTH: usize = 7;
 const COL_SEP_WIDTH: usize = 1;
 /// Width of the author column.
 const COL_AUTHOR_WIDTH: usize = 20;
+/// Width of the ` ▸DRAFT` badge (including leading space).
+const COL_DRAFT_WIDTH: usize = 7;
 
 fn truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -163,7 +165,8 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 + COL_NUMBER_WIDTH
                 + COL_SEP_WIDTH
                 + COL_AUTHOR_WIDTH
-                + 2;
+                + 2
+                + if pr.draft { COL_DRAFT_WIDTH } else { 0 };
             let title_width = inner_width.saturating_sub(fixed);
             let title_display = truncate(&pr.title, title_width);
 
@@ -207,7 +210,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .highlight_style(t.selection_style());
 
     let mut list_state = ListState::default();
-    list_state.select(Some(app.rr_cursor));
+    list_state.select(Some(app.rr_cursor.min(app.rr_prs.len().saturating_sub(1))));
 
     f.render_stateful_widget(list, area, &mut list_state);
 }

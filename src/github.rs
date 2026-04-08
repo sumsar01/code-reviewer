@@ -430,7 +430,7 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<ReviewComment>> {
-        let comments = self
+        let mut page = self
             .octo
             .pulls(owner, repo)
             .list_comments(Some(pr_number))
@@ -439,17 +439,30 @@ impl GitHubClient {
             .await
             .with_context(|| format!("Fetching comments for PR #{pr_number}"))?;
 
-        let result = comments
-            .items
-            .into_iter()
-            .map(|c| ReviewComment {
-                author: c.user.as_ref().map(|u| u.login.clone()).unwrap_or_default(),
-                body: c.body.clone(),
-                path: Some(c.path.clone()),
-                line: c.line,
-                created_at: c.created_at.to_rfc3339(),
-            })
-            .collect();
+        let mut result: Vec<ReviewComment> = Vec::new();
+
+        loop {
+            for c in &page.items {
+                result.push(ReviewComment {
+                    author: c.user.as_ref().map(|u| u.login.clone()).unwrap_or_default(),
+                    body: c.body.clone(),
+                    path: Some(c.path.clone()),
+                    line: c.line,
+                    created_at: c.created_at.to_rfc3339(),
+                });
+            }
+
+            match self
+                .octo
+                .get_page::<octocrab::models::pulls::Comment>(
+                    &page.next,
+                )
+                .await?
+            {
+                Some(next) => page = next,
+                None => break,
+            }
+        }
 
         Ok(result)
     }
