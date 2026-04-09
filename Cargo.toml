@@ -1,6 +1,6 @@
 [package]
 name = "code-reviewer"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Keyboard-driven TUI for reviewing GitHub PRs"
 repository = "https://github.com/sumsar01/code-reviewer"
