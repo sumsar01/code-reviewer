@@ -338,6 +338,8 @@ pub(crate) enum BgMsg {
     SinglePrLoaded(PullRequest),
     /// Failed to fetch a single PR.
     SinglePrError(String),
+    /// Result of a `git checkout <branch>` operation: Ok(branch_name) or Err(message).
+    CheckoutResult(Result<String, String>),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -420,6 +422,15 @@ pub struct App {
     /// When true: includes team review requests (`review-requested:<username>`).
     pub rr_show_all: bool,
 
+    /// The screen we were on before entering PrDetail.  Used to navigate back
+    /// to the correct screen (PrList vs ReviewRequests) when the user presses
+    /// Esc / q from the detail view.
+    pub prev_screen: Screen,
+    /// Saved PR list and cursor from before a review-requests-initiated fetch.
+    /// Restored when the user presses Esc / q from the detail view if we came
+    /// from the ReviewRequests screen.
+    pub saved_prs: Option<(Vec<PullRequest>, usize)>,
+
     pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
 }
@@ -498,6 +509,8 @@ impl App {
             rr_cursor: 0,
             rr_load_state: LoadState::Idle,
             rr_show_all: false,
+            prev_screen: Screen::PrList,
+            saved_prs: None,
             tx,
             rx,
         };
@@ -782,6 +795,7 @@ impl App {
             }
             BgMsg::ReviewRequestPrsLoaded(prs) => {
                 self.rr_prs = prs;
+                self.rr_cursor = 0;
                 self.rr_load_state = LoadState::Idle;
             }
             BgMsg::ReviewRequestPrsError(e) => {
@@ -789,7 +803,10 @@ impl App {
             }
             BgMsg::SinglePrLoaded(pr) => {
                 // A full PR was fetched after the user selected one from the
-                // review-requests screen.  Push it as the current PR and open detail.
+                // review-requests screen.  Save the existing PR list so it can
+                // be restored when the user navigates back.
+                self.saved_prs = Some((self.prs.clone(), self.pr_cursor));
+                self.prev_screen = Screen::ReviewRequests;
                 self.prs = vec![pr];
                 self.pr_cursor = 0;
                 self.pr_load_state = LoadState::Idle;
@@ -797,8 +814,20 @@ impl App {
             }
             BgMsg::SinglePrError(e) => {
                 self.status_message = Some((format!("Could not load PR: {e}"), Instant::now()));
-                self.rr_load_state = LoadState::Idle;
+                // Reset pr_load_state (not rr_load_state) since this error comes
+                // from the single-PR fetch path, not the review-requests list fetch.
+                self.pr_load_state = LoadState::Idle;
             }
+            BgMsg::CheckoutResult(result) => match result {
+                Ok(branch) => {
+                    self.status_message =
+                        Some((format!("Checked out branch '{branch}'"), Instant::now()));
+                }
+                Err(msg) => {
+                    self.status_message =
+                        Some((format!("Checkout failed: {msg}"), Instant::now()));
+                }
+            },
         }
     }
 
@@ -1194,6 +1223,13 @@ impl App {
         let head_sha = pr.head_sha.clone();
         let base_sha = pr.base_sha.clone();
 
+        // Record where we came from so Esc / q can navigate back correctly.
+        // If prev_screen was already set to ReviewRequests by SinglePrLoaded,
+        // leave it; otherwise default to PrList.
+        if self.prev_screen != Screen::ReviewRequests {
+            self.prev_screen = Screen::PrList;
+        }
+
         self.screen = Screen::PrDetail;
         self.detail_tab = DetailTab::Diff;
         self.diff_files = Vec::new();
@@ -1306,12 +1342,26 @@ impl App {
     pub fn checkout_pr_branch(&mut self) {
         let Some(pr) = self.prs.get(self.pr_cursor) else { return };
         let branch = pr.head_branch.clone();
+        let tx = self.tx.clone();
 
         // Run git checkout in a blocking thread so we don't block the async runtime
         tokio::task::spawn_blocking(move || {
-            let _ = Command::new("git")
+            let output = Command::new("git")
                 .args(["checkout", &branch])
-                .status();
+                .output();
+            let result = match output {
+                Ok(out) if out.status.success() => Ok(branch),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Err(if stderr.is_empty() {
+                        format!("git checkout exited with {}", out.status)
+                    } else {
+                        stderr
+                    })
+                }
+                Err(e) => Err(format!("Failed to run git: {e}")),
+            };
+            let _ = tx.send(BgMsg::CheckoutResult(result));
         });
     }
 

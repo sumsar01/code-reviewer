@@ -68,12 +68,23 @@ pub fn handle_key_detail(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bo
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.g_pending = false;
-            app.screen = Screen::PrList;
             app.diff_scroll = 0;
             app.diff_hscroll = 0;
             app.comments_scroll = 0;
             app.diff_file_cursor = 0;
             app.diff_line_cursor = 0;
+            // If we entered PrDetail from the ReviewRequests screen, restore
+            // the saved PR list and go back there instead of PrList.
+            if app.prev_screen == Screen::ReviewRequests {
+                if let Some((prs, cursor)) = app.saved_prs.take() {
+                    app.prs = prs;
+                    app.pr_cursor = cursor;
+                }
+                app.prev_screen = Screen::PrList;
+                app.screen = Screen::ReviewRequests;
+            } else {
+                app.screen = Screen::PrList;
+            }
         }
         KeyCode::Char('?') => {
             app.g_pending = false;
