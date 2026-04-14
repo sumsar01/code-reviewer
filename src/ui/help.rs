@@ -34,6 +34,8 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("gg / G", "Jump to top / bottom"),
     ("0 / $", "Scroll to line start / end"),
     ("n / N", "Next / previous changed file"),
+    ("[", "Jump to PR below in stack (closer to trunk)"),
+    ("]", "Jump to PR above in stack (further from trunk)"),
     ("c", "Checkout PR branch"),
     ("o", "Open PR in browser"),
     ("v", "Toggle file reviewed"),

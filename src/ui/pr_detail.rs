@@ -1,5 +1,5 @@
 use crate::app::{App, DetailTab, LoadState};
-use crate::github::CheckRun;
+use crate::github::{CheckRun, PullRequest};
 use crate::ui::{
     comments, diff, difftastic,
     theme::Theme,
@@ -14,6 +14,46 @@ use ratatui::{
 };
 use std::sync::Arc;
 
+/// Ordered list of (pr_number, head_branch) entries for all PRs in a stack,
+/// plus the index of the currently displayed PR within that list.
+type StackInfo = (Vec<(u64, String)>, usize);
+
+/// Build stack context for the currently displayed PR.
+///
+/// Returns `None` when the PR is standalone (not in a stack).
+fn build_stack_info(app: &App, pr: &PullRequest) -> Option<StackInfo> {
+    app.stack_positions.get(&pr.number)?;
+
+    // Walk down to the bottom of the stack.
+    let mut bottom_number = pr.number;
+    while let Some(below) = app
+        .stack_positions
+        .get(&bottom_number)
+        .and_then(|p| p.below)
+    {
+        bottom_number = below;
+    }
+
+    // Walk up from the bottom, collecting (number, head_branch) in order.
+    let number_to_pr: std::collections::HashMap<u64, &PullRequest> =
+        app.prs.iter().map(|p| (p.number, p)).collect();
+
+    let mut chain: Vec<(u64, String)> = Vec::new();
+    let mut current = bottom_number;
+    loop {
+        if let Some(p) = number_to_pr.get(&current) {
+            chain.push((p.number, p.head_branch.clone()));
+        }
+        match app.stack_positions.get(&current).and_then(|p| p.above) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+
+    let current_idx = chain.iter().position(|(n, _)| *n == pr.number)?;
+    Some((chain, current_idx))
+}
+
 pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let pr = match app.prs.get(app.pr_cursor) {
         Some(pr) => pr.clone(),
@@ -23,14 +63,18 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     let area = f.area();
     let (reviewed, total) = app.reviewed_progress();
 
+    // Build stack navigator info (None for standalone PRs).
+    let stack_info = build_stack_info(app, &pr);
+    let stack_line = u16::from(stack_info.is_some());
+
     let has_reviewed_line = total > 0;
     let has_decision_line = pr.review_decision.is_some();
     let check_runs_lines = check_runs_line_count(&app.check_runs_load_state, &app.check_runs);
-    // Layout: first 3 lines (title/author/stats) span full width.
+    // Layout: first (3 + stack_line) lines span full width.
     // Below that, left col = reviewed + decision, right col = CI checks.
-    // Height = 3 fixed + max(left optional lines, right CI lines) + 2 borders.
+    // Height = (3 + stack_line) fixed + max(left optional lines, right CI lines) + 2 borders.
     let left_optional = u16::from(has_reviewed_line) + u16::from(has_decision_line);
-    let header_height = 2 + 3 + left_optional.max(check_runs_lines);
+    let header_height = 2 + 3 + stack_line + left_optional.max(check_runs_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -50,6 +94,7 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
         (reviewed, total),
         &app.check_runs_load_state,
         &app.check_runs,
+        stack_info.as_ref(),
     );
     render_tabs(f, app, chunks[1], t);
 
@@ -74,6 +119,7 @@ fn render_pr_header(
     reviewed_progress: (usize, usize),
     check_runs_load_state: &LoadState,
     check_runs: &[CheckRun],
+    stack_info: Option<&StackInfo>,
 ) {
     let draft = if pr.draft { "  ▸DRAFT" } else { "" };
     let (reviewed, total) = reviewed_progress;
@@ -90,8 +136,11 @@ fn render_pr_header(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // ── Top 3 lines: title / author / stats (full width) ─────────────────────
-    let top_lines = vec![
+    let stack_line = u16::from(stack_info.is_some());
+    let top_height = 3 + stack_line;
+
+    // ── Top lines: title / author / stats [/ stack] (full width) ─────────────
+    let mut top_lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("#{} ", pr.number),
@@ -131,12 +180,38 @@ fn render_pr_header(
         }),
     ];
 
-    // Top section spans full inner width, exactly 3 rows tall.
+    // Optional 4th line: Stack navigator.
+    // Example: Stack:  [#121 auth-layer] → [#122 api-routes ★] → [#123 frontend]
+    if let Some((chain, current_idx)) = stack_info {
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled("Stack: ", Style::default().fg(t.text_dim)));
+        for (i, (num, branch)) in chain.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" → ", Style::default().fg(t.text_dim)));
+            }
+            if i == *current_idx {
+                spans.push(Span::styled(
+                    format!("[#{num} {branch} ★]"),
+                    Style::default()
+                        .fg(t.text_accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("[#{num} {branch}]"),
+                    Style::default().fg(t.text_dim),
+                ));
+            }
+        }
+        top_lines.push(Line::from(spans));
+    }
+
+    // Top section spans full inner width.
     let top_area = Rect {
         x: inner.x,
         y: inner.y,
         width: inner.width,
-        height: 3.min(inner.height),
+        height: top_height.min(inner.height),
     };
     f.render_widget(
         Paragraph::new(top_lines).style(t.background_style()),
@@ -144,16 +219,16 @@ fn render_pr_header(
     );
 
     // Nothing left to render below the top section.
-    if inner.height <= 3 {
+    if inner.height <= top_height {
         return;
     }
 
     // ── Bottom section: left col (reviewed/decision) | right col (CI) ────────
     let bottom_area = Rect {
         x: inner.x,
-        y: inner.y + 3,
+        y: inner.y + top_height,
         width: inner.width,
-        height: inner.height - 3,
+        height: inner.height - top_height,
     };
 
     let has_ci = !matches!(check_runs_load_state, LoadState::Idle) || !check_runs.is_empty();
@@ -406,6 +481,7 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ("Space", "toggle tree"),
         ("j/k", "scroll"),
         ("n/N", "next/prev file"),
+        ("[/]", "stack prev/next"),
         ("v", "mark reviewed"),
         ("A/R/C", "approve/request/comment"),
         ("c", "checkout"),

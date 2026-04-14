@@ -3,6 +3,7 @@ mod config;
 mod git;
 mod github;
 mod input;
+mod stack;
 mod syntax;
 mod ui;
 mod updater;

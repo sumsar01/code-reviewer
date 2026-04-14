@@ -1,6 +1,7 @@
 use crate::config::{self, Config};
 use crate::git::{self, RepoInfo};
 use crate::github::{CheckRun, DiffFile, GitHubClient, PrMetadata, PullRequest, ReviewRequestPr, RepoSearchResult, ReviewComment, parse_diff};
+use crate::stack::{StackPosition, compute_stack_positions};
 use crate::syntax::SyntaxHighlighter;
 use crate::ui;
 use crate::ui::theme::Theme;
@@ -9,7 +10,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     process::Command,
     sync::Arc,
@@ -431,6 +432,11 @@ pub struct App {
     /// from the ReviewRequests screen.
     pub saved_prs: Option<(Vec<PullRequest>, usize)>,
 
+    /// Stack positions computed from the current PR list.
+    /// Maps pr_number → StackPosition for every PR that is part of a stack.
+    /// Recomputed every time `prs` is updated.
+    pub stack_positions: HashMap<u64, StackPosition>,
+
     pub(crate) tx: mpsc::UnboundedSender<BgMsg>,
     rx: mpsc::UnboundedReceiver<BgMsg>,
 }
@@ -511,6 +517,7 @@ impl App {
             rr_show_all: false,
             prev_screen: Screen::PrList,
             saved_prs: None,
+            stack_positions: HashMap::new(),
             tx,
             rx,
         };
@@ -697,6 +704,7 @@ impl App {
             BgMsg::PrsLoaded(prs) => {
                 self.prs = prs;
                 self.pr_load_state = LoadState::Idle;
+                self.stack_positions = compute_stack_positions(&self.prs);
                 self.fetch_review_decisions();
             }
             BgMsg::PrsError(e) => {
@@ -1273,6 +1281,49 @@ impl App {
             .collect()
     }
 
+    /// Returns the display order for the PR list: stacks are grouped contiguously
+    /// (bottom → top), standalone PRs keep their original order.
+    /// Returns a Vec of indices into `self.prs`.
+    pub fn pr_display_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = Vec::with_capacity(self.prs.len());
+        let mut visited = vec![false; self.prs.len()];
+        let number_to_idx: HashMap<u64, usize> = self
+            .prs
+            .iter()
+            .enumerate()
+            .map(|(i, pr)| (pr.number, i))
+            .collect();
+
+        for (i, pr) in self.prs.iter().enumerate() {
+            if visited[i] {
+                continue;
+            }
+            if let Some(pos) = self.stack_positions.get(&pr.number) {
+                if pos.depth == 0 {
+                    let mut current = pr.number;
+                    loop {
+                        if let Some(&idx) = number_to_idx.get(&current) {
+                            if !visited[idx] {
+                                visited[idx] = true;
+                                order.push(idx);
+                            }
+                        }
+                        match self.stack_positions.get(&current).and_then(|p| p.above) {
+                            Some(next) => current = next,
+                            None => break,
+                        }
+                    }
+                    continue;
+                }
+            }
+            if !visited[i] {
+                visited[i] = true;
+                order.push(i);
+            }
+        }
+        order
+    }
+
     /// Returns (reviewed_count, total_count) for the current PR's diff files.
     pub fn reviewed_progress(&self) -> (usize, usize) {
         let total = self.diff_files.len();
@@ -1336,6 +1387,26 @@ impl App {
                     DetailTab::Comments => {}
                 }
             }
+        }
+    }
+
+    /// Navigate to the PR above (`]`) or below (`[`) in the stack.
+    ///
+    /// "Above" means deeper into the stack (further from trunk); "below" means
+    /// closer to trunk.  Does nothing when the current PR is not in a stack or
+    /// there is no neighbour in the requested direction.
+    pub fn navigate_stack(&mut self, go_up: bool) {
+        let Some(pr) = self.prs.get(self.pr_cursor) else { return };
+        let pr_number = pr.number;
+        let Some(pos) = self.stack_positions.get(&pr_number) else { return };
+
+        let target_number = if go_up { pos.above } else { pos.below };
+        let Some(target) = target_number else { return };
+
+        // Find the index of the target PR in `self.prs`.
+        if let Some(idx) = self.prs.iter().position(|p| p.number == target) {
+            self.pr_cursor = idx;
+            self.open_detail();
         }
     }
 
