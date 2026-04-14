@@ -273,10 +273,6 @@ fn render_pr_header(
                 ]));
             }
             LoadState::Idle if !check_runs.is_empty() => {
-                ci_lines.push(Line::from(Span::styled(
-                    "CI Checks:",
-                    Style::default().fg(t.text_dim),
-                )));
                 for run in check_runs {
                     let (icon, color) = check_run_icon(run);
                     let conclusion_label = run
@@ -433,7 +429,7 @@ fn format_duration(started: Option<&str>, completed: Option<&str>) -> String {
 fn check_runs_line_count(state: &LoadState, runs: &[CheckRun]) -> u16 {
     match state {
         LoadState::Loading => 1,
-        LoadState::Idle if !runs.is_empty() => 1 + runs.len() as u16, // header line + one per run
+        LoadState::Idle if !runs.is_empty() => runs.len() as u16,
         LoadState::Error(_) => 1,
         _ => 0,
     }
