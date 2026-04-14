@@ -144,7 +144,7 @@ pub fn render(f: &mut Frame, app: &App, t: &Theme) {
     // ── Status bar ────────────────────────────────────────────────────────────
     let hints: &[(&str, &str)] = &[
         ("type", "search"),
-        ("j/k", "navigate"),
+        ("↑/↓", "navigate"),
         ("Tab", "fill"),
         ("Enter", "open"),
         ("Ctrl+W", "del word"),

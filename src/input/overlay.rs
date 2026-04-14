@@ -160,13 +160,13 @@ pub fn handle_key_repo_switcher(app: &mut App, code: KeyCode, mods: KeyModifiers
                 state.last_keystroke = Some(std::time::Instant::now());
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Down => {
             let count = state.suggestion_count();
             if count > 0 && state.cursor + 1 < count {
                 state.cursor += 1;
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Up => {
             state.cursor = state.cursor.saturating_sub(1);
         }
         KeyCode::Backspace => {
