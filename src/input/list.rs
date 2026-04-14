@@ -8,11 +8,21 @@ pub fn handle_key_list(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.prs.is_empty() {
-                app.pr_cursor = (app.pr_cursor + 1).min(app.prs.len() - 1);
+                let order = app.pr_display_order();
+                if let Some(display_pos) = order.iter().position(|&idx| idx == app.pr_cursor) {
+                    let next_pos = (display_pos + 1).min(order.len() - 1);
+                    app.pr_cursor = order[next_pos];
+                }
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.pr_cursor = app.pr_cursor.saturating_sub(1);
+            if !app.prs.is_empty() {
+                let order = app.pr_display_order();
+                if let Some(display_pos) = order.iter().position(|&idx| idx == app.pr_cursor) {
+                    let prev_pos = display_pos.saturating_sub(1);
+                    app.pr_cursor = order[prev_pos];
+                }
+            }
         }
         KeyCode::Enter => {
             if !app.prs.is_empty() {

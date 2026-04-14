@@ -277,6 +277,15 @@ pub fn handle_key_detail(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bo
                 let _ = open::that(&pr.url);
             }
         }
+        // ── Stack navigation: [ = go to PR below, ] = go to PR above ────
+        KeyCode::Char('[') => {
+            app.g_pending = false;
+            app.navigate_stack(false); // go toward trunk (below)
+        }
+        KeyCode::Char(']') => {
+            app.g_pending = false;
+            app.navigate_stack(true); // go away from trunk (above)
+        }
         KeyCode::Char('v') => {
             app.g_pending = false;
             app.toggle_reviewed();

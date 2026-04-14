@@ -11,6 +11,7 @@ A terminal UI for reviewing GitHub pull requests without leaving your editor wor
 - Theme picker with multiple built-in themes
 - Check out PR branches directly from the TUI
 - Open any PR in the browser
+- **Stacked PR support** — detects stacked PRs automatically and groups them in the list; navigate between stack members with `[` / `]`
 
 ## Requirements
 
@@ -56,9 +57,29 @@ The tool auto-detects the repository from your working directory.
 | `Tab`     | Switch Diff ↔ Comments ↔ Difftastic |
 | `j / k`   | Scroll                              |
 | `n / N`   | Next / previous changed file        |
+| `[ / ]`   | Jump to PR below / above in stack   |
 | `c`       | Checkout PR branch                  |
 | `o`       | Open PR in browser                  |
 | `Esc / q` | Back to list                        |
+
+### Stacked PRs
+
+`prr` automatically detects stacked PRs using base/head branch matching — no
+stacking tool required. When PR B's base branch equals PR A's head branch, B is
+considered stacked on A.
+
+In the **PR list**, stacked PRs are grouped contiguously with tree connectors
+(`┬`, `├`, `└`) and a stack-size badge (e.g. `≡3`) on the bottom PR.
+
+In the **PR detail** header, a Stack line shows all members of the stack with
+the current PR highlighted:
+
+```
+Stack:  [#121 auth-layer] → [#122 api-routes ★] → [#123 frontend]
+```
+
+Use `[` to jump to the PR below (closer to trunk) and `]` to jump to the PR
+above (further from trunk).
 
 ### Global
 
