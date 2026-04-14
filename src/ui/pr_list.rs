@@ -214,6 +214,11 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
 
     let order = display_order(app);
 
+    // Only reserve the stack prefix/badge columns when at least one PR in the
+    // loaded list is part of a stack. When false the columns are omitted
+    // entirely, giving the title more room and keeping the layout clean.
+    let any_stacked = !app.stack_positions.is_empty();
+
     // Map the cursor (index into app.prs) to the display position.
     let display_cursor = order
         .iter()
@@ -225,8 +230,8 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         .map(|&pr_idx| {
             let pr = &app.prs[pr_idx];
 
-            // Stack tree connector and optional badge.
-            let (stack_prefix, stack_badge_span) =
+            // Stack tree connector and optional badge — only when stacks exist.
+            let (stack_prefix, stack_badge_span) = if any_stacked {
                 if let Some(pos) = app.stack_positions.get(&pr.number) {
                     let connector = match (pos.below.is_some(), pos.above.is_some()) {
                         (false, true) => "┬ ",  // bottom of stack
@@ -246,10 +251,15 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                     } else {
                         Span::raw(" ".repeat(STACK_BADGE_WIDTH))
                     };
-                    (connector, badge)
+                    (connector, Some(badge))
                 } else {
-                    ("  ", Span::raw(" ".repeat(STACK_BADGE_WIDTH)))
-                };
+                    // Standalone PR in a list that has other stacks: pad to align.
+                    ("  ", Some(Span::raw(" ".repeat(STACK_BADGE_WIDTH))))
+                }
+            } else {
+                // No stacks at all: emit nothing for both columns.
+                ("", None)
+            };
 
             let number = format!(" #{:<5}", pr.number);
             let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
@@ -262,8 +272,11 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             let stats = format!("{:>6} {:>6} {:>7}", additions, deletions, total);
 
             let inner_width = area.width.saturating_sub(2) as usize;
-            let fixed = COL_STACK_PREFIX_WIDTH
-                + COL_NUMBER_WIDTH
+            let fixed = if any_stacked {
+                COL_STACK_PREFIX_WIDTH
+            } else {
+                0
+            } + COL_NUMBER_WIDTH
                 + COL_SEP1_WIDTH
                 + COL_INDENT_WIDTH
                 + COL_AUTHOR_WIDTH
@@ -272,27 +285,30 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                 + if pr.draft { COL_DRAFT_WIDTH } else { 0 }
                 + CI_COL_WIDTH
                 + REVIEW_COL_WIDTH
-                + STACK_BADGE_WIDTH;
+                + if any_stacked { STACK_BADGE_WIDTH } else { 0 };
             let title_width = inner_width.saturating_sub(fixed);
             let title_display = truncate(&pr.title, title_width);
 
-            let mut spans = vec![
-                Span::styled(
+            let mut spans: Vec<Span> = Vec::new();
+
+            if !stack_prefix.is_empty() {
+                spans.push(Span::styled(
                     stack_prefix,
                     Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    number,
-                    Style::default()
-                        .fg(t.pr_number)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:<width$}", title_display, width = title_width),
-                    Style::default().fg(t.text),
-                ),
-            ];
+                ));
+            }
+
+            spans.push(Span::styled(
+                number,
+                Style::default()
+                    .fg(t.pr_number)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{:<width$}", title_display, width = title_width),
+                Style::default().fg(t.text),
+            ));
 
             if pr.draft {
                 spans.push(Span::styled(
@@ -332,7 +348,9 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
 
             spans.push(ci_span);
             spans.push(review_span);
-            spans.push(stack_badge_span);
+            if let Some(badge) = stack_badge_span {
+                spans.push(badge);
+            }
 
             ListItem::new(Line::from(spans))
         })
