@@ -240,10 +240,17 @@ fn render_pr_header(
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(bottom_area);
 
+        // Only occupy as many rows as there is actual content — no dead space.
+        let left_height =
+            (u16::from(total > 0) + u16::from(pr.review_decision.is_some())).min(cols[0].height);
+        let left_area = Rect {
+            height: left_height,
+            ..cols[0]
+        };
         f.render_widget(
             Paragraph::new(reviewed_decision_lines(pr, reviewed, total, t))
                 .style(t.background_style()),
-            cols[0],
+            left_area,
         );
 
         // Right col: CI checks
