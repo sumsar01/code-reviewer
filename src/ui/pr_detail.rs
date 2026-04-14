@@ -73,8 +73,13 @@ pub fn render(f: &mut Frame, app: &mut App, t: &Theme) {
     // Layout: first (3 + stack_line) lines span full width.
     // Below that, left col = reviewed + decision, right col = CI checks.
     // Height = (3 + stack_line) fixed + max(left optional lines, right CI lines) + 2 borders.
+    let has_stats = matches!(
+        (pr.additions, pr.deletions, pr.changed_files),
+        (Some(_), Some(_), Some(_))
+    );
+    let top_lines = 2 + u16::from(has_stats) + stack_line; // title + author always; stats + stack optional
     let left_optional = u16::from(has_reviewed_line) + u16::from(has_decision_line);
-    let header_height = 2 + 3 + stack_line + left_optional.max(check_runs_lines);
+    let header_height = 2 + top_lines + left_optional.max(check_runs_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -137,9 +142,13 @@ fn render_pr_header(
     f.render_widget(block, area);
 
     let stack_line = u16::from(stack_info.is_some());
-    let top_height = 3 + stack_line;
+    let has_stats = matches!(
+        (pr.additions, pr.deletions, pr.changed_files),
+        (Some(_), Some(_), Some(_))
+    );
+    let top_height = 2 + u16::from(has_stats) + stack_line; // title + author always; stats + stack optional
 
-    // ── Top lines: title / author / stats [/ stack] (full width) ─────────────
+    // ── Top lines: title / author [/ stats] [/ stack] (full width) ──────────
     let mut top_lines = vec![
         Line::from(vec![
             Span::styled(
@@ -166,19 +175,20 @@ fn render_pr_header(
             Span::styled(" → ", Style::default().fg(t.text_dim)),
             Span::styled(pr.base_branch.clone(), Style::default().fg(t.text_dim)),
         ]),
-        Line::from(match (pr.additions, pr.deletions, pr.changed_files) {
-            (Some(a), Some(d), Some(c)) => vec![
-                Span::styled(format!("+{a}"), Style::default().fg(t.stats_added)),
-                Span::styled("  ", Style::default()),
-                Span::styled(format!("-{d}"), Style::default().fg(t.stats_removed)),
-                Span::styled(
-                    format!("  {c} files changed"),
-                    Style::default().fg(t.text_dim),
-                ),
-            ],
-            _ => vec![],
-        }),
     ];
+
+    // Stats line is optional — only shown when the API returned the values.
+    if let (Some(a), Some(d), Some(c)) = (pr.additions, pr.deletions, pr.changed_files) {
+        top_lines.push(Line::from(vec![
+            Span::styled(format!("+{a}"), Style::default().fg(t.stats_added)),
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("-{d}"), Style::default().fg(t.stats_removed)),
+            Span::styled(
+                format!("  {c} files changed"),
+                Style::default().fg(t.text_dim),
+            ),
+        ]));
+    }
 
     // Optional 4th line: Stack navigator.
     // Example: Stack:  [#121 auth-layer] → [#122 api-routes ★] → [#123 frontend]
