@@ -62,7 +62,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         "[direct requests]"
     };
 
-    let line = Line::from(vec![
+    let left = Line::from(vec![
         Span::styled(
             " prr ",
             Style::default()
@@ -83,12 +83,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ),
     ]);
 
-    let p = Paragraph::new(line).block(
+    let right = Line::from(vec![
+        Span::styled(
+            format!("v{}  ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(t.text_dim),
+        ),
+    ]).right_aligned();
+
+    let p = Paragraph::new(left).block(
         Block::default()
             .borders(Borders::NONE)
             .style(t.background_style()),
     );
     f.render_widget(p, area);
+
+    let version_area = Rect { height: 1, ..area };
+    let p2 = Paragraph::new(right).block(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(t.background_style()),
+    );
+    f.render_widget(p2, version_area);
 }
 
 fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
