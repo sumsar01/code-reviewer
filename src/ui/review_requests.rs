@@ -1,5 +1,5 @@
 use crate::app::{App, LoadState};
-use crate::github::{CiStatus, ReviewDecision};
+use crate::github::{CiStatus, ReviewDecision, ReviewRequestPr};
 use crate::ui::{theme::Theme, utils::render_hint_bar};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -36,6 +36,86 @@ fn truncate(s: &str, max_chars: usize) -> String {
             .collect::<String>()
             + "…"
     }
+}
+
+/// An item in the flat display list — either a section header or a PR row.
+enum DisplayItem<'a> {
+    SectionHeader {
+        label: &'static str,
+        count: usize,
+        dimmed: bool,
+    },
+    PrRow {
+        pr: &'a ReviewRequestPr,
+        pr_index: usize,
+        dimmed: bool,
+    },
+}
+
+/// Build a flat display list with section headers inserted.
+/// `rr_cursor` is an index into `prs`; the returned vec contains headers
+/// and rows so the caller can map pr_index → display position.
+fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
+    let needs: Vec<(usize, &ReviewRequestPr)> = prs
+        .iter()
+        .enumerate()
+        .filter(|(_, pr)| {
+            matches!(
+                pr.review_decision,
+                ReviewDecision::ReviewRequired | ReviewDecision::Unknown
+            )
+        })
+        .collect();
+
+    let waiting: Vec<(usize, &ReviewRequestPr)> = prs
+        .iter()
+        .enumerate()
+        .filter(|(_, pr)| {
+            matches!(
+                pr.review_decision,
+                ReviewDecision::Approved | ReviewDecision::ChangesRequested
+            )
+        })
+        .collect();
+
+    let mut items: Vec<DisplayItem> = Vec::new();
+
+    items.push(DisplayItem::SectionHeader {
+        label: "NEEDS YOUR REVIEW",
+        count: needs.len(),
+        dimmed: false,
+    });
+    for (idx, pr) in &needs {
+        items.push(DisplayItem::PrRow {
+            pr,
+            pr_index: *idx,
+            dimmed: false,
+        });
+    }
+
+    if !waiting.is_empty() {
+        items.push(DisplayItem::SectionHeader {
+            label: "WAITING FOR AUTHOR",
+            count: waiting.len(),
+            dimmed: true,
+        });
+        for (idx, pr) in &waiting {
+            items.push(DisplayItem::PrRow {
+                pr,
+                pr_index: *idx,
+                dimmed: true,
+            });
+        }
+    }
+
+    items
+}
+
+/// Find the display-list position for a given pr_index (skipping headers).
+fn display_index_for_pr(display_items: &[DisplayItem], pr_index: usize) -> Option<usize> {
+    display_items.iter().position(|item| {
+        matches!(item, DisplayItem::PrRow { pr_index: idx, .. } if *idx == pr_index)
+    })
 }
 
 pub fn render(f: &mut Frame, app: &App, t: &Theme) {
@@ -83,12 +163,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ),
     ]);
 
-    let right = Line::from(vec![
-        Span::styled(
-            format!("v{}  ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(t.text_dim),
-        ),
-    ]).right_aligned();
+    let right = Line::from(vec![Span::styled(
+        format!("v{}  ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(t.text_dim),
+    )])
+    .right_aligned();
 
     let p = Paragraph::new(left).block(
         Block::default()
@@ -170,7 +249,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     }
 
     // Fixed columns total (excluding title).
-    let fixed_cols = 1  // leading space
+    let fixed_cols = 2  // leading indent under header (2 spaces)
         + COL_REPO_WIDTH + COL_GAP
         + COL_NUMBER_WIDTH + COL_GAP
         + COL_REVIEW_WIDTH + COL_GAP
@@ -178,97 +257,158 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         + COL_UPDATED_WIDTH + COL_GAP
         + COL_AUTHOR_WIDTH;
 
-    let items: Vec<ListItem> = app
-        .rr_prs
+    let display = build_display_items(&app.rr_prs);
+
+    let items: Vec<ListItem> = display
         .iter()
-        .map(|pr| {
-            let repo = truncate(
-                &format!("{}/{}", pr.repo_owner, pr.repo_name),
-                COL_REPO_WIDTH,
-            );
-            let repo_col = format!("{:<width$}", repo, width = COL_REPO_WIDTH);
-            let number = format!("#{:<width$}", pr.number, width = COL_NUMBER_WIDTH - 1);
-            let updated = format!("{:<width$}", pr.updated_at, width = COL_UPDATED_WIDTH);
-            let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
-
-            let inner_width = area.width.saturating_sub(2) as usize;
-            let draft_extra = if pr.draft { COL_DRAFT_WIDTH + COL_GAP } else { 0 };
-            let title_width = inner_width
-                .saturating_sub(fixed_cols + draft_extra + COL_GAP);
-            let title_display = format!(
-                "{:<width$}",
-                truncate(&pr.title, title_width),
-                width = title_width
-            );
-
-            // Review decision badge
-            let (review_text, review_style) = match &pr.review_decision {
-                ReviewDecision::Approved => (
-                    format!("{:<width$}", "✓ Approved", width = COL_REVIEW_WIDTH),
-                    Style::default().fg(t.diff_added_fg).add_modifier(Modifier::BOLD),
-                ),
-                ReviewDecision::ChangesRequested => (
-                    format!("{:<width$}", "✗ Changes", width = COL_REVIEW_WIDTH),
-                    Style::default().fg(t.diff_removed_fg).add_modifier(Modifier::BOLD),
-                ),
-                ReviewDecision::ReviewRequired | ReviewDecision::Unknown => (
-                    format!("{:<width$}", "⏳ Waiting", width = COL_REVIEW_WIDTH),
-                    Style::default().fg(t.text_dim),
-                ),
-            };
-
-            // CI status badge
-            let (ci_text, ci_style) = match &pr.ci_status {
-                CiStatus::Success => (
-                    format!("{:<width$}", "● pass", width = COL_CI_WIDTH),
-                    Style::default().fg(t.diff_added_fg),
-                ),
-                CiStatus::Failure => (
-                    format!("{:<width$}", "✗ fail", width = COL_CI_WIDTH),
-                    Style::default().fg(t.diff_removed_fg),
-                ),
-                CiStatus::Pending => (
-                    format!("{:<width$}", "○ pend", width = COL_CI_WIDTH),
-                    Style::default().fg(t.pr_number),
-                ),
-                CiStatus::Unknown => (
-                    format!("{:<width$}", "– –", width = COL_CI_WIDTH),
-                    Style::default().fg(t.text_dim),
-                ),
-            };
-
-            let mut spans = vec![
-                Span::styled(" ", Style::default()),
-                Span::styled(repo_col, Style::default().fg(t.text_dim)),
-                Span::styled("  ", Style::default()),
-                Span::styled(
-                    number,
+        .map(|item| match item {
+            DisplayItem::SectionHeader {
+                label,
+                count,
+                dimmed,
+            } => {
+                let style = if *dimmed {
+                    Style::default().fg(t.text_dim)
+                } else {
                     Style::default()
-                        .fg(t.pr_number)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ", Style::default()),
-                Span::styled(review_text, review_style),
-                Span::styled("  ", Style::default()),
-                Span::styled(ci_text, ci_style),
-                Span::styled("  ", Style::default()),
-                Span::styled(updated, Style::default().fg(t.text_dim)),
-                Span::styled("  ", Style::default()),
-                Span::styled(title_display, Style::default().fg(t.text)),
-            ];
+                        .fg(t.text_accent)
+                        .add_modifier(Modifier::BOLD)
+                };
+                ListItem::new(Line::from(vec![Span::styled(
+                    format!(" ▼ {} ({})", label, count),
+                    style,
+                )]))
+            }
+            DisplayItem::PrRow { pr, dimmed, .. } => {
+                let repo = truncate(
+                    &format!("{}/{}", pr.repo_owner, pr.repo_name),
+                    COL_REPO_WIDTH,
+                );
+                let repo_col = format!("{:<width$}", repo, width = COL_REPO_WIDTH);
+                let number = format!("#{:<width$}", pr.number, width = COL_NUMBER_WIDTH - 1);
+                let updated = format!("{:<width$}", pr.updated_at, width = COL_UPDATED_WIDTH);
+                let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
 
-            if pr.draft {
+                let inner_width = area.width.saturating_sub(2) as usize;
+                let draft_extra = if pr.draft { COL_DRAFT_WIDTH + COL_GAP } else { 0 };
+                let title_width =
+                    inner_width.saturating_sub(fixed_cols + draft_extra + COL_GAP);
+                let title_display = format!(
+                    "{:<width$}",
+                    truncate(&pr.title, title_width),
+                    width = title_width
+                );
+
+                // Review decision badge
+                let (review_text, review_style) = match &pr.review_decision {
+                    ReviewDecision::Approved => (
+                        format!("{:<width$}", "✓ Approved", width = COL_REVIEW_WIDTH),
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default()
+                                .fg(t.diff_added_fg)
+                                .add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    ReviewDecision::ChangesRequested => (
+                        format!("{:<width$}", "✗ Changes", width = COL_REVIEW_WIDTH),
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default()
+                                .fg(t.diff_removed_fg)
+                                .add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    ReviewDecision::ReviewRequired | ReviewDecision::Unknown => (
+                        format!("{:<width$}", "⏳ Waiting", width = COL_REVIEW_WIDTH),
+                        Style::default()
+                            .fg(t.pr_number)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                };
+
+                // CI status badge
+                let (ci_text, ci_style) = match &pr.ci_status {
+                    CiStatus::Success => (
+                        format!("{:<width$}", "● pass", width = COL_CI_WIDTH),
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default().fg(t.diff_added_fg)
+                        },
+                    ),
+                    CiStatus::Failure => (
+                        format!("{:<width$}", "✗ fail", width = COL_CI_WIDTH),
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default().fg(t.diff_removed_fg)
+                        },
+                    ),
+                    CiStatus::Pending => (
+                        format!("{:<width$}", "○ pend", width = COL_CI_WIDTH),
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default().fg(t.pr_number)
+                        },
+                    ),
+                    CiStatus::Unknown => (
+                        format!("{:<width$}", "– –", width = COL_CI_WIDTH),
+                        Style::default().fg(t.text_dim),
+                    ),
+                };
+
+                let dim_text_style = if *dimmed {
+                    Style::default().fg(t.text_dim)
+                } else {
+                    Style::default().fg(t.text)
+                };
+
+                let mut spans = vec![
+                    Span::styled("  ", Style::default()), // indent under section header
+                    Span::styled(repo_col, Style::default().fg(t.text_dim)),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        number,
+                        if *dimmed {
+                            Style::default().fg(t.text_dim)
+                        } else {
+                            Style::default()
+                                .fg(t.pr_number)
+                                .add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(review_text, review_style),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(ci_text, ci_style),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(updated, Style::default().fg(t.text_dim)),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(title_display, dim_text_style),
+                ];
+
+                if pr.draft {
+                    spans.push(Span::styled("  ", Style::default()));
+                    spans.push(Span::styled(
+                        "▸DRAFT",
+                        Style::default()
+                            .fg(t.pr_draft)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+
                 spans.push(Span::styled("  ", Style::default()));
                 spans.push(Span::styled(
-                    "▸DRAFT",
-                    Style::default().fg(t.pr_draft).add_modifier(Modifier::BOLD),
+                    author,
+                    Style::default().fg(t.pr_author),
                 ));
+
+                ListItem::new(Line::from(spans))
             }
-
-            spans.push(Span::styled("  ", Style::default()));
-            spans.push(Span::styled(author, Style::default().fg(t.pr_author)));
-
-            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -282,7 +422,9 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .highlight_style(t.selection_style());
 
     let mut list_state = ListState::default();
-    list_state.select(Some(app.rr_cursor.min(app.rr_prs.len().saturating_sub(1))));
+    // Map rr_cursor (pr index) → display position (which skips section headers)
+    let display_pos = display_index_for_pr(&display, app.rr_cursor).unwrap_or(1);
+    list_state.select(Some(display_pos));
 
     f.render_stateful_widget(list, area, &mut list_state);
 }
