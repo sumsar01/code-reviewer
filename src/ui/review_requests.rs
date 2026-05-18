@@ -1,4 +1,5 @@
 use crate::app::{App, LoadState};
+use crate::github::{CiStatus, ReviewDecision};
 use crate::ui::{theme::Theme, utils::render_hint_bar};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -12,12 +13,18 @@ use ratatui::{
 const COL_REPO_WIDTH: usize = 22;
 /// Width of the PR number column (` #NNNNN`).
 const COL_NUMBER_WIDTH: usize = 7;
-/// Separator between number and title.
-const COL_SEP_WIDTH: usize = 1;
+/// Width of the review-decision badge (e.g. `✓ Approved  `).
+const COL_REVIEW_WIDTH: usize = 13;
+/// Width of the CI status badge (e.g. `● pass  `).
+const COL_CI_WIDTH: usize = 8;
+/// Width of the updated-at column (e.g. `3d ago   `).
+const COL_UPDATED_WIDTH: usize = 9;
 /// Width of the author column.
-const COL_AUTHOR_WIDTH: usize = 20;
+const COL_AUTHOR_WIDTH: usize = 18;
 /// Width of the ` ▸DRAFT` badge (including leading space).
 const COL_DRAFT_WIDTH: usize = 7;
+/// Gaps between columns (single space).
+const COL_GAP: usize = 2;
 
 fn truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -147,6 +154,15 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         return;
     }
 
+    // Fixed columns total (excluding title).
+    let fixed_cols = 1  // leading space
+        + COL_REPO_WIDTH + COL_GAP
+        + COL_NUMBER_WIDTH + COL_GAP
+        + COL_REVIEW_WIDTH + COL_GAP
+        + COL_CI_WIDTH + COL_GAP
+        + COL_UPDATED_WIDTH + COL_GAP
+        + COL_AUTHOR_WIDTH;
+
     let items: Vec<ListItem> = app
         .rr_prs
         .iter()
@@ -156,39 +172,80 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 COL_REPO_WIDTH,
             );
             let repo_col = format!("{:<width$}", repo, width = COL_REPO_WIDTH);
-            let number = format!(" #{:<5}", pr.number);
+            let number = format!("#{:<width$}", pr.number, width = COL_NUMBER_WIDTH - 1);
+            let updated = format!("{:<width$}", pr.updated_at, width = COL_UPDATED_WIDTH);
             let author = format!("{:<width$}", pr.author, width = COL_AUTHOR_WIDTH);
 
             let inner_width = area.width.saturating_sub(2) as usize;
-            let fixed = COL_REPO_WIDTH
-                + COL_SEP_WIDTH
-                + COL_NUMBER_WIDTH
-                + COL_SEP_WIDTH
-                + COL_AUTHOR_WIDTH
-                + 2
-                + if pr.draft { COL_DRAFT_WIDTH } else { 0 };
-            let title_width = inner_width.saturating_sub(fixed);
-            let title_display = truncate(&pr.title, title_width);
+            let draft_extra = if pr.draft { COL_DRAFT_WIDTH + COL_GAP } else { 0 };
+            let title_width = inner_width
+                .saturating_sub(fixed_cols + draft_extra + COL_GAP);
+            let title_display = format!(
+                "{:<width$}",
+                truncate(&pr.title, title_width),
+                width = title_width
+            );
+
+            // Review decision badge
+            let (review_text, review_style) = match &pr.review_decision {
+                ReviewDecision::Approved => (
+                    format!("{:<width$}", "✓ Approved", width = COL_REVIEW_WIDTH),
+                    Style::default().fg(t.diff_added_fg).add_modifier(Modifier::BOLD),
+                ),
+                ReviewDecision::ChangesRequested => (
+                    format!("{:<width$}", "✗ Changes", width = COL_REVIEW_WIDTH),
+                    Style::default().fg(t.diff_removed_fg).add_modifier(Modifier::BOLD),
+                ),
+                ReviewDecision::ReviewRequired | ReviewDecision::Unknown => (
+                    format!("{:<width$}", "⏳ Waiting", width = COL_REVIEW_WIDTH),
+                    Style::default().fg(t.text_dim),
+                ),
+            };
+
+            // CI status badge
+            let (ci_text, ci_style) = match &pr.ci_status {
+                CiStatus::Success => (
+                    format!("{:<width$}", "● pass", width = COL_CI_WIDTH),
+                    Style::default().fg(t.diff_added_fg),
+                ),
+                CiStatus::Failure => (
+                    format!("{:<width$}", "✗ fail", width = COL_CI_WIDTH),
+                    Style::default().fg(t.diff_removed_fg),
+                ),
+                CiStatus::Pending => (
+                    format!("{:<width$}", "○ pend", width = COL_CI_WIDTH),
+                    Style::default().fg(t.pr_number),
+                ),
+                CiStatus::Unknown => (
+                    format!("{:<width$}", "– –", width = COL_CI_WIDTH),
+                    Style::default().fg(t.text_dim),
+                ),
+            };
 
             let mut spans = vec![
                 Span::styled(" ", Style::default()),
                 Span::styled(repo_col, Style::default().fg(t.text_dim)),
+                Span::styled("  ", Style::default()),
                 Span::styled(
                     number,
                     Style::default()
                         .fg(t.pr_number)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" ", Style::default()),
-                Span::styled(
-                    format!("{:<width$}", title_display, width = title_width),
-                    Style::default().fg(t.text),
-                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(review_text, review_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(ci_text, ci_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(updated, Style::default().fg(t.text_dim)),
+                Span::styled("  ", Style::default()),
+                Span::styled(title_display, Style::default().fg(t.text)),
             ];
 
             if pr.draft {
+                spans.push(Span::styled("  ", Style::default()));
                 spans.push(Span::styled(
-                    " ▸DRAFT",
+                    "▸DRAFT",
                     Style::default().fg(t.pr_draft).add_modifier(Modifier::BOLD),
                 ));
             }
