@@ -280,10 +280,6 @@ impl GitHubClient {
     /// via any GitHub team the user belongs to.
     pub async fn fetch_review_requested_prs(&self, direct_only: bool) -> Result<Vec<ReviewRequestPr>> {
         #[derive(Deserialize)]
-        struct GqlResponse {
-            data: Option<GqlData>,
-        }
-        #[derive(Deserialize)]
         struct GqlData {
             search: GqlSearch,
         }
@@ -413,7 +409,7 @@ impl GitHubClient {
                 "variables": variables,
             });
 
-            let resp: GqlResponse = self
+            let resp: GqlData = self
                 .octo
                 .graphql(&body)
                 .await
@@ -421,10 +417,7 @@ impl GitHubClient {
                     format!("GraphQL review-requested search for {}", self.username)
                 })?;
 
-            let search = match resp.data {
-                Some(d) => d.search,
-                None => break,
-            };
+            let search = resp.search;
 
             for node in search.nodes {
                 let pr = match node {
