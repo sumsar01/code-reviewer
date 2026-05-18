@@ -512,12 +512,11 @@ impl GitHubClient {
         let mut page: u32 = 1;
 
         loop {
-            let url = format!(
-                "orgs/{org}/teams/{team_slug}/repos?per_page=100&page={page}"
-            );
+            let url = format!("/orgs/{org}/teams/{team_slug}/repos");
+            let page_str = page.to_string();
             let page_repos: Vec<TeamRepo> = self
                 .octo
-                .get(&url, None::<&()>)
+                .get(&url, Some(&[("per_page", "100"), ("page", page_str.as_str())]))
                 .await
                 .with_context(|| format!("Fetching repos for team {org}/{team_slug}"))?;
 
