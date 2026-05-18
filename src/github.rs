@@ -7,9 +7,6 @@ use std::process::Command;
 /// Number of pull requests fetched per page when listing a repository's PRs.
 const PR_LIST_PAGE_SIZE: u8 = 50;
 
-/// Number of review-request search results fetched per page.
-const REVIEW_REQUEST_PAGE_SIZE: u8 = 50;
-
 /// Hard cap on GitHub repository search results per query.
 const REPO_SEARCH_MAX_RESULTS: u8 = 10;
 
@@ -23,10 +20,26 @@ pub struct RepoSearchResult {
     pub stars: u32,
 }
 
+/// Review decision state for a PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    Unknown,
+}
+
+/// Aggregated CI / status-check state for a PR's head commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiStatus {
+    Success,
+    Failure,
+    Pending,
+    Unknown,
+}
+
 /// A cross-repo PR where the authenticated user has been requested as a reviewer.
-/// Sourced from GitHub's `/search/issues` endpoint (`is:pr is:open review-requested:ME`).
-/// Lighter than `PullRequest` — no SHAs or file stats, because the search API
-/// returns `Issue` objects rather than full PR objects.
+/// Sourced from GitHub's GraphQL search API.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ReviewRequestPr {
@@ -37,6 +50,9 @@ pub struct ReviewRequestPr {
     pub repo_owner: String,
     pub repo_name: String,
     pub draft: bool,
+    pub review_decision: ReviewDecision,
+    pub ci_status: CiStatus,
+    pub updated_at: String, // pre-formatted relative/absolute string
 }
 
 /// A GitHub pull request (subset of fields we care about).
@@ -251,81 +267,216 @@ impl GitHubClient {
         Ok(prs)
     }
 
-    /// Fetch all open PRs across all repos where the authenticated user has been
-    /// requested as a reviewer, using the GitHub search API.
+    /// Fetch all open, unmerged PRs across all repos where the authenticated user
+    /// has been requested as a reviewer, using the GitHub GraphQL search API.
+    ///
+    /// Each result includes `reviewDecision`, `statusCheckRollup` (CI), and
+    /// `updatedAt` so the review-requests panel can show a full status overview
+    /// without additional API calls.
     ///
     /// When `direct_only` is true (the default), uses `review-requested:@me` which
     /// matches only direct personal requests — team review requests are excluded.
     /// When false, uses `review-requested:<username>` which includes PRs requested
     /// via any GitHub team the user belongs to.
     pub async fn fetch_review_requested_prs(&self, direct_only: bool) -> Result<Vec<ReviewRequestPr>> {
-        // GitHub's search API returns `Issue` objects for both issues and PRs.
-        // The `pull_request` field is present (and non-null) when the item is a PR.
         #[derive(Deserialize)]
-        struct SearchPage {
-            items: Vec<SearchIssue>,
+        struct GqlResponse {
+            data: Option<GqlData>,
         }
         #[derive(Deserialize)]
-        struct SearchIssue {
+        struct GqlData {
+            search: GqlSearch,
+        }
+        #[derive(Deserialize)]
+        struct GqlSearch {
+            #[serde(rename = "pageInfo")]
+            page_info: PageInfo,
+            nodes: Vec<GqlNode>,
+        }
+        #[derive(Deserialize)]
+        struct PageInfo {
+            #[serde(rename = "hasNextPage")]
+            has_next_page: bool,
+            #[serde(rename = "endCursor")]
+            end_cursor: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "__typename")]
+        enum GqlNode {
+            PullRequest(GqlPr),
+            #[serde(other)]
+            Other,
+        }
+        #[derive(Deserialize)]
+        struct GqlPr {
             number: u64,
             title: String,
-            html_url: String,
-            user: Option<SearchUser>,
-            pull_request: Option<serde_json::Value>, // present iff it's a PR
-            draft: Option<bool>,
-            repository_url: String, // "https://api.github.com/repos/owner/name"
+            url: String,
+            #[serde(rename = "isDraft")]
+            is_draft: bool,
+            #[serde(rename = "updatedAt")]
+            updated_at: String, // ISO 8601
+            #[serde(rename = "reviewDecision")]
+            review_decision: Option<String>,
+            author: Option<GqlActor>,
+            #[serde(rename = "baseRepository")]
+            base_repository: Option<GqlRepo>,
+            commits: GqlCommitConnection,
         }
         #[derive(Deserialize)]
-        struct SearchUser {
+        struct GqlActor {
             login: String,
         }
+        #[derive(Deserialize)]
+        struct GqlRepo {
+            name: String,
+            owner: GqlOwner,
+        }
+        #[derive(Deserialize)]
+        struct GqlOwner {
+            login: String,
+        }
+        #[derive(Deserialize)]
+        struct GqlCommitConnection {
+            nodes: Vec<GqlCommitNode>,
+        }
+        #[derive(Deserialize)]
+        struct GqlCommitNode {
+            commit: GqlCommit,
+        }
+        #[derive(Deserialize)]
+        struct GqlCommit {
+            #[serde(rename = "statusCheckRollup")]
+            status_check_rollup: Option<GqlStatusRollup>,
+        }
+        #[derive(Deserialize)]
+        struct GqlStatusRollup {
+            state: String,
+        }
 
-        let reviewer = if direct_only { "@me".to_string() } else { self.username.clone() };
-        let query = format!("is:pr is:open review-requested:{reviewer}");
+        let reviewer = if direct_only {
+            "@me".to_string()
+        } else {
+            self.username.clone()
+        };
+
+        // `is:unmerged` filters out merged PRs; combined with `is:open` we get
+        // only PRs that are still open and awaiting review.
+        let search_query_base = format!(
+            "is:pr is:open is:unmerged review-requested:{reviewer}"
+        );
+
+        let graphql_query = r#"
+            query($q: String!, $after: String) {
+              search(query: $q, type: ISSUE, first: 50, after: $after) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                nodes {
+                  __typename
+                  ... on PullRequest {
+                    number
+                    title
+                    url
+                    isDraft
+                    updatedAt
+                    reviewDecision
+                    author { login }
+                    baseRepository {
+                      name
+                      owner { login }
+                    }
+                    commits(last: 1) {
+                      nodes {
+                        commit {
+                          statusCheckRollup { state }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+
         let mut prs: Vec<ReviewRequestPr> = Vec::new();
-        let mut page_num: u32 = 1;
+        let mut cursor: Option<String> = None;
 
         loop {
-            let resp: SearchPage = self
+            let variables = serde_json::json!({
+                "q": search_query_base,
+                "after": cursor,
+            });
+            let body = serde_json::json!({
+                "query": graphql_query,
+                "variables": variables,
+            });
+
+            let resp: GqlResponse = self
                 .octo
-                .get(
-                    "/search/issues",
-                    Some(&[
-                        ("q", query.as_str()),
-                        ("per_page", &REVIEW_REQUEST_PAGE_SIZE.to_string()),
-                        ("page", &page_num.to_string()),
-                    ]),
-                )
+                .graphql(&body)
                 .await
-                .with_context(|| format!("Searching review-requested PRs for {}", self.username))?;
+                .with_context(|| {
+                    format!("GraphQL review-requested search for {}", self.username)
+                })?;
 
-            let count = resp.items.len();
+            let search = match resp.data {
+                Some(d) => d.search,
+                None => break,
+            };
 
-            for issue in resp.items {
-                // Skip non-PRs (shouldn't happen given `is:pr`, but be safe)
-                if issue.pull_request.is_none() {
-                    continue;
-                }
+            for node in search.nodes {
+                let pr = match node {
+                    GqlNode::PullRequest(p) => p,
+                    GqlNode::Other => continue,
+                };
 
-                // Parse owner/name from "https://api.github.com/repos/owner/name"
-                let (repo_owner, repo_name) = parse_repository_url(&issue.repository_url);
+                let (repo_owner, repo_name) = pr
+                    .base_repository
+                    .map(|r| (r.owner.login, r.name))
+                    .unwrap_or_default();
+
+                let review_decision = match pr.review_decision.as_deref() {
+                    Some("APPROVED") => ReviewDecision::Approved,
+                    Some("CHANGES_REQUESTED") => ReviewDecision::ChangesRequested,
+                    Some("REVIEW_REQUIRED") => ReviewDecision::ReviewRequired,
+                    _ => ReviewDecision::Unknown,
+                };
+
+                let ci_status = match pr
+                    .commits
+                    .nodes
+                    .first()
+                    .and_then(|cn| cn.commit.status_check_rollup.as_ref())
+                    .map(|r| r.state.as_str())
+                {
+                    Some("SUCCESS") => CiStatus::Success,
+                    Some("FAILURE") | Some("ERROR") => CiStatus::Failure,
+                    Some("PENDING") | Some("EXPECTED") => CiStatus::Pending,
+                    _ => CiStatus::Unknown,
+                };
+
+                let updated_at = format_relative_time(&pr.updated_at);
 
                 prs.push(ReviewRequestPr {
-                    number: issue.number,
-                    title: issue.title,
-                    author: issue.user.map(|u| u.login).unwrap_or_default(),
-                    url: issue.html_url,
+                    number: pr.number,
+                    title: pr.title,
+                    author: pr.author.map(|a| a.login).unwrap_or_default(),
+                    url: pr.url,
                     repo_owner,
                     repo_name,
-                    draft: issue.draft.unwrap_or(false),
+                    draft: pr.is_draft,
+                    review_decision,
+                    ci_status,
+                    updated_at,
                 });
             }
 
-            // Stop paginating when we received fewer items than the page size
-            if count < REVIEW_REQUEST_PAGE_SIZE as usize {
+            if !search.page_info.has_next_page {
                 break;
             }
-            page_num += 1;
+            cursor = search.page_info.end_cursor;
         }
 
         Ok(prs)
@@ -948,13 +1099,71 @@ fn list_gh_accounts() -> Result<Vec<String>> {
 
 /// Parse `"https://api.github.com/repos/owner/name"` into `("owner", "name")`.
 /// Returns empty strings if the URL doesn't match the expected format.
-fn parse_repository_url(url: &str) -> (String, String) {
-    // Strip any trailing slash, then take the last two path segments.
-    let trimmed = url.trim_end_matches('/');
-    let mut parts = trimmed.rsplitn(3, '/');
-    let name = parts.next().unwrap_or("").to_string();
-    let owner = parts.next().unwrap_or("").to_string();
-    (owner, name)
+/// Format an ISO 8601 timestamp (e.g. `"2024-05-15T10:30:00Z"`) as a
+/// human-readable relative string for display in the review-requests panel.
+///
+/// Returns strings like `"2h ago"`, `"3d ago"`, `"May 15"`, `"Jan 2023"`.
+fn format_relative_time(iso: &str) -> String {
+    // Parse the timestamp manually to avoid pulling in chrono.
+    // Expected format: YYYY-MM-DDTHH:MM:SSZ (or with +00:00)
+    let ts = iso.trim_end_matches('Z').trim_end_matches("+00:00");
+    let (date_part, time_part) = ts.split_once('T').unwrap_or((ts, "00:00:00"));
+    let date_parts: Vec<&str> = date_part.splitn(3, '-').collect();
+    let time_parts: Vec<&str> = time_part.splitn(3, ':').collect();
+
+    let year: i64 = date_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let month: i64 = date_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let day: i64 = date_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let hour: i64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minute: i64 = time_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Convert to a rough Unix timestamp (good enough for relative display).
+    // Days in each month (non-leap approximation — fine for display purposes).
+    const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_this_year: i64 = DAYS_IN_MONTH
+        .iter()
+        .enumerate()
+        .take((month - 1).max(0) as usize)
+        .map(|(i, &d)| if i == 1 && leap { d + 1 } else { d })
+        .sum::<i64>()
+        + day
+        - 1;
+    let approx_ts =
+        ((year - 1970) * 365 + (year - 1969) / 4 + days_this_year) * 86400
+        + hour * 3600
+        + minute * 60;
+
+    // Get current Unix time via std::time.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let diff = now_secs - approx_ts;
+
+    if diff < 3600 {
+        let mins = (diff / 60).max(1);
+        format!("{mins}m ago")
+    } else if diff < 86400 {
+        let hrs = diff / 3600;
+        format!("{hrs}h ago")
+    } else if diff < 7 * 86400 {
+        let days = diff / 86400;
+        format!("{days}d ago")
+    } else {
+        // Absolute: "May 15" or "May 2023" if over a year ago
+        let month_name = match month {
+            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+            5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+            9 => "Sep", 10 => "Oct", 11 => "Nov", _ => "Dec",
+        };
+        if diff > 365 * 86400 {
+            format!("{month_name} {year}")
+        } else {
+            format!("{month_name} {day}")
+        }
+    }
 }
 
 // ── Diff parsing ──────────────────────────────────────────────────────────────
