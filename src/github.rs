@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use octocrab::Octocrab;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 /// Number of pull requests fetched per page when listing a repository's PRs.
@@ -278,7 +278,7 @@ impl GitHubClient {
     /// matches only direct personal requests — team review requests are excluded.
     /// When false, uses `review-requested:<username>` which includes PRs requested
     /// via any GitHub team the user belongs to.
-    pub async fn fetch_review_requested_prs(&self, direct_only: bool) -> Result<Vec<ReviewRequestPr>> {
+    pub async fn fetch_review_requested_prs(&self, direct_only: bool, team_blacklist: &[String]) -> Result<Vec<ReviewRequestPr>> {
         #[derive(Deserialize)]
         struct GqlData {
             search: GqlSearch,
@@ -472,10 +472,67 @@ impl GitHubClient {
             cursor = search.page_info.end_cursor;
         }
 
+        // Apply team blacklist: collect the set of repos each blacklisted team
+        // has access to, then remove any PR whose repo is in that set.
+        if !team_blacklist.is_empty() {
+            let mut blacklisted_repos: HashSet<String> = HashSet::new();
+            for entry in team_blacklist {
+                let parts: Vec<&str> = entry.splitn(2, '/').collect();
+                if parts.len() == 2 {
+                    match self.fetch_team_repos(parts[0], parts[1]).await {
+                        Ok(repos) => blacklisted_repos.extend(repos),
+                        Err(e) => {
+                            // Log but don't abort — a missing team shouldn't break everything.
+                            eprintln!("prr: warning: could not fetch repos for team {entry}: {e:#}");
+                        }
+                    }
+                }
+            }
+            if !blacklisted_repos.is_empty() {
+                prs.retain(|pr| {
+                    let key = format!("{}/{}", pr.repo_owner, pr.repo_name);
+                    !blacklisted_repos.contains(&key)
+                });
+            }
+        }
+
         Ok(prs)
     }
 
-    /// Fetch a single PR by owner, repo, and number.
+    /// Fetch the set of repos a team has access to. Returns repo keys in
+    /// `"owner/repo"` format. Uses the REST API:
+    /// `GET /orgs/{org}/teams/{team_slug}/repos`
+    async fn fetch_team_repos(&self, org: &str, team_slug: &str) -> Result<HashSet<String>> {
+        #[derive(Deserialize)]
+        struct TeamRepo {
+            full_name: String,
+        }
+
+        let mut repos: HashSet<String> = HashSet::new();
+        let mut page: u32 = 1;
+
+        loop {
+            let url = format!(
+                "orgs/{org}/teams/{team_slug}/repos?per_page=100&page={page}"
+            );
+            let page_repos: Vec<TeamRepo> = self
+                .octo
+                .get(&url, None::<&()>)
+                .await
+                .with_context(|| format!("Fetching repos for team {org}/{team_slug}"))?;
+
+            let done = page_repos.len() < 100;
+            for r in page_repos {
+                repos.insert(r.full_name);
+            }
+            if done {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(repos)
+    }
     /// Returns a fully-populated `PullRequest` (including head/base SHAs needed
     /// to open the diff view).
     pub async fn fetch_single_pr(

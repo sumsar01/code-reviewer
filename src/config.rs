@@ -52,6 +52,11 @@ pub struct UiConfig {
     /// Recently visited repos (owner/name), most recent first. Capped at 10.
     #[serde(default)]
     pub recent_repos: Vec<String>,
+    /// Teams whose review requests should be hidden from the review-requests screen.
+    /// Format: "org/team-slug" (e.g. "whiteaway/developers").
+    /// PRs in repos that the blacklisted team has access to are filtered out.
+    #[serde(default)]
+    pub review_request_team_blacklist: Vec<String>,
 }
 
 fn default_theme() -> String {
@@ -65,6 +70,7 @@ impl Default for UiConfig {
             show_all_prs: false,
             theme: default_theme(),
             recent_repos: Vec::new(),
+            review_request_team_blacklist: Vec::new(),
         }
     }
 }
