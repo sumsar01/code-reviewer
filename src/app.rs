@@ -978,10 +978,11 @@ impl App {
         let gh = Arc::clone(&self.github);
         let tx = self.tx.clone();
         let direct_only = !self.rr_show_all;
-        let team_blacklist = self.config.ui.review_request_team_blacklist.clone();
+        let hide_dependabot = self.config.ui.review_request_hide_dependabot;
+        let max_age_days = self.config.ui.review_request_max_age_days;
 
         tokio::spawn(async move {
-            match gh.fetch_review_requested_prs(direct_only, &team_blacklist).await {
+            match gh.fetch_review_requested_prs(direct_only, hide_dependabot, max_age_days).await {
                 Ok(prs) => { let _ = tx.send(BgMsg::ReviewRequestPrsLoaded(prs)); }
                 Err(e) => { let _ = tx.send(BgMsg::ReviewRequestPrsError(format!("{:#}", e))); }
             }

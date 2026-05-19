@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use octocrab::Octocrab;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Command;
 
 /// Number of pull requests fetched per page when listing a repository's PRs.
@@ -52,7 +52,8 @@ pub struct ReviewRequestPr {
     pub draft: bool,
     pub review_decision: ReviewDecision,
     pub ci_status: CiStatus,
-    pub updated_at: String, // pre-formatted relative/absolute string
+    pub updated_at: String,     // pre-formatted relative string for display
+    pub updated_at_unix: i64,   // raw Unix timestamp for age filtering
 }
 
 /// A GitHub pull request (subset of fields we care about).
@@ -278,7 +279,7 @@ impl GitHubClient {
     /// matches only direct personal requests — team review requests are excluded.
     /// When false, uses `review-requested:<username>` which includes PRs requested
     /// via any GitHub team the user belongs to.
-    pub async fn fetch_review_requested_prs(&self, direct_only: bool, team_blacklist: &[String]) -> Result<Vec<ReviewRequestPr>> {
+    pub async fn fetch_review_requested_prs(&self, direct_only: bool, hide_dependabot: bool, max_age_days: u64) -> Result<Vec<ReviewRequestPr>> {
         #[derive(Deserialize)]
         struct GqlData {
             search: GqlSearch,
@@ -450,6 +451,7 @@ impl GitHubClient {
                     _ => CiStatus::Unknown,
                 };
 
+                let updated_at_unix = parse_iso_to_unix(&pr.updated_at);
                 let updated_at = format_relative_time(&pr.updated_at);
 
                 prs.push(ReviewRequestPr {
@@ -463,6 +465,7 @@ impl GitHubClient {
                     review_decision,
                     ci_status,
                     updated_at,
+                    updated_at_unix,
                 });
             }
 
@@ -472,66 +475,26 @@ impl GitHubClient {
             cursor = search.page_info.end_cursor;
         }
 
-        // Apply team blacklist: collect the set of repos each blacklisted team
-        // has access to, then remove any PR whose repo is in that set.
-        if !team_blacklist.is_empty() {
-            let mut blacklisted_repos: HashSet<String> = HashSet::new();
-            for entry in team_blacklist {
-                let parts: Vec<&str> = entry.splitn(2, '/').collect();
-                if parts.len() == 2 {
-                    match self.fetch_team_repos(parts[0], parts[1]).await {
-                        Ok(repos) => blacklisted_repos.extend(repos),
-                        Err(e) => {
-                            // Log but don't abort — a missing team shouldn't break everything.
-                            eprintln!("prr: warning: could not fetch repos for team {entry}: {e:#}");
-                        }
-                    }
-                }
-            }
-            if !blacklisted_repos.is_empty() {
-                prs.retain(|pr| {
-                    let key = format!("{}/{}", pr.repo_owner, pr.repo_name);
-                    !blacklisted_repos.contains(&key)
-                });
-            }
+        // Filter by age (updated_at).
+        if max_age_days > 0 {
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                - (max_age_days as i64 * 86400);
+            prs.retain(|pr| pr.updated_at_unix >= cutoff);
+        }
+
+        // Filter out Dependabot PRs.
+        if hide_dependabot {
+            prs.retain(|pr| {
+                pr.author != "dependabot[bot]" && pr.author != "dependabot"
+            });
         }
 
         Ok(prs)
     }
 
-    /// Fetch the set of repos a team has access to. Returns repo keys in
-    /// `"owner/repo"` format. Uses the REST API:
-    /// `GET /orgs/{org}/teams/{team_slug}/repos`
-    async fn fetch_team_repos(&self, org: &str, team_slug: &str) -> Result<HashSet<String>> {
-        #[derive(Deserialize)]
-        struct TeamRepo {
-            full_name: String,
-        }
-
-        let mut repos: HashSet<String> = HashSet::new();
-        let mut page: u32 = 1;
-
-        loop {
-            let url = format!("/orgs/{org}/teams/{team_slug}/repos");
-            let page_str = page.to_string();
-            let page_repos: Vec<TeamRepo> = self
-                .octo
-                .get(&url, Some(&[("per_page", "100"), ("page", page_str.as_str())]))
-                .await
-                .with_context(|| format!("Fetching repos for team {org}/{team_slug}"))?;
-
-            let done = page_repos.len() < 100;
-            for r in page_repos {
-                repos.insert(r.full_name);
-            }
-            if done {
-                break;
-            }
-            page += 1;
-        }
-
-        Ok(repos)
-    }
     /// Returns a fully-populated `PullRequest` (including head/base SHAs needed
     /// to open the diff view).
     pub async fn fetch_single_pr(
@@ -1152,9 +1115,8 @@ fn list_gh_accounts() -> Result<Vec<String>> {
 /// human-readable relative string for display in the review-requests panel.
 ///
 /// Returns strings like `"2h ago"`, `"3d ago"`, `"May 15"`, `"Jan 2023"`.
-fn format_relative_time(iso: &str) -> String {
-    // Parse the timestamp manually to avoid pulling in chrono.
-    // Expected format: YYYY-MM-DDTHH:MM:SSZ (or with +00:00)
+/// Parse an ISO 8601 timestamp string to an approximate Unix timestamp (seconds).
+fn parse_iso_to_unix(iso: &str) -> i64 {
     let ts = iso.trim_end_matches('Z').trim_end_matches("+00:00");
     let (date_part, time_part) = ts.split_once('T').unwrap_or((ts, "00:00:00"));
     let date_parts: Vec<&str> = date_part.splitn(3, '-').collect();
@@ -1166,8 +1128,6 @@ fn format_relative_time(iso: &str) -> String {
     let hour: i64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let minute: i64 = time_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // Convert to a rough Unix timestamp (good enough for relative display).
-    // Days in each month (non-leap approximation — fine for display purposes).
     const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let days_this_year: i64 = DAYS_IN_MONTH
@@ -1178,12 +1138,21 @@ fn format_relative_time(iso: &str) -> String {
         .sum::<i64>()
         + day
         - 1;
-    let approx_ts =
-        ((year - 1970) * 365 + (year - 1969) / 4 + days_this_year) * 86400
+    ((year - 1970) * 365 + (year - 1969) / 4 + days_this_year) * 86400
         + hour * 3600
-        + minute * 60;
+        + minute * 60
+}
 
-    // Get current Unix time via std::time.
+fn format_relative_time(iso: &str) -> String {
+    let approx_ts = parse_iso_to_unix(iso);
+
+    // Need month/day/year for the absolute date display branch.
+    let ts = iso.trim_end_matches('Z').trim_end_matches("+00:00");
+    let (date_part, _) = ts.split_once('T').unwrap_or((ts, ""));
+    let date_parts: Vec<&str> = date_part.splitn(3, '-').collect();
+    let year: i64 = date_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let month: i64 = date_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let day: i64 = date_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

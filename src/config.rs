@@ -52,15 +52,21 @@ pub struct UiConfig {
     /// Recently visited repos (owner/name), most recent first. Capped at 10.
     #[serde(default)]
     pub recent_repos: Vec<String>,
-    /// Teams whose review requests should be hidden from the review-requests screen.
-    /// Format: "org/team-slug" (e.g. "whiteaway/developers").
-    /// PRs in repos that the blacklisted team has access to are filtered out.
+    /// Hide PRs authored by Dependabot from the review-requests screen.
     #[serde(default)]
-    pub review_request_team_blacklist: Vec<String>,
+    pub review_request_hide_dependabot: bool,
+    /// Hide PRs that have not been updated in more than this many days.
+    /// Set to 0 to disable. Defaults to 30.
+    #[serde(default = "default_review_request_max_age_days")]
+    pub review_request_max_age_days: u64,
 }
 
 fn default_theme() -> String {
     "tokyonight".to_string()
+}
+
+fn default_review_request_max_age_days() -> u64 {
+    30
 }
 
 impl Default for UiConfig {
@@ -70,7 +76,8 @@ impl Default for UiConfig {
             show_all_prs: false,
             theme: default_theme(),
             recent_repos: Vec::new(),
-            review_request_team_blacklist: Vec::new(),
+            review_request_hide_dependabot: false,
+            review_request_max_age_days: default_review_request_max_age_days(),
         }
     }
 }
