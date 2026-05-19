@@ -294,10 +294,14 @@ impl GitHubClient {
             "is:pr is:open is:unmerged reviewed-by:@me -review-requested:{reviewer}"
         );
 
-        let (requested, reviewed) = tokio::try_join!(
+        let (requested, reviewed) = tokio::join!(
             self.fetch_prs_by_query(&requested_query, hide_dependabot, max_age_days),
             self.fetch_prs_by_query(&reviewed_query, hide_dependabot, max_age_days),
-        )?;
+        );
+
+        // The reviewed-by query is best-effort; don't fail the whole screen if it errors.
+        let requested = requested?;
+        let reviewed = reviewed.unwrap_or_default();
 
         Ok((requested, reviewed))
     }
