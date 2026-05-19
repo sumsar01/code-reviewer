@@ -270,16 +270,45 @@ impl GitHubClient {
 
     /// Fetch all open, unmerged PRs across all repos where the authenticated user
     /// has been requested as a reviewer, using the GitHub GraphQL search API.
+    /// Also fetches PRs already reviewed by the user.
     ///
-    /// Each result includes `reviewDecision`, `statusCheckRollup` (CI), and
-    /// `updatedAt` so the review-requests panel can show a full status overview
-    /// without additional API calls.
-    ///
-    /// When `direct_only` is true (the default), uses `review-requested:@me` which
-    /// matches only direct personal requests — team review requests are excluded.
-    /// When false, uses `review-requested:<username>` which includes PRs requested
-    /// via any GitHub team the user belongs to.
-    pub async fn fetch_review_requested_prs(&self, direct_only: bool, hide_dependabot: bool, max_age_days: u64) -> Result<Vec<ReviewRequestPr>> {
+    /// Returns `(requested_prs, reviewed_prs)`.
+    pub async fn fetch_review_requested_prs(
+        &self,
+        direct_only: bool,
+        hide_dependabot: bool,
+        max_age_days: u64,
+    ) -> Result<(Vec<ReviewRequestPr>, Vec<ReviewRequestPr>)> {
+        let reviewer = if direct_only {
+            "@me".to_string()
+        } else {
+            self.username.clone()
+        };
+
+        let requested_query = format!(
+            "is:pr is:open is:unmerged review-requested:{reviewer}"
+        );
+        // PRs the user has already reviewed but are still open and no longer
+        // in their review-requested queue.
+        let reviewed_query = format!(
+            "is:pr is:open is:unmerged reviewed-by:@me -review-requested:{reviewer}"
+        );
+
+        let (requested, reviewed) = tokio::try_join!(
+            self.fetch_prs_by_query(&requested_query, hide_dependabot, max_age_days),
+            self.fetch_prs_by_query(&reviewed_query, hide_dependabot, max_age_days),
+        )?;
+
+        Ok((requested, reviewed))
+    }
+
+    /// Internal helper: run a single GraphQL PR search query and return filtered results.
+    async fn fetch_prs_by_query(
+        &self,
+        search_query_base: &str,
+        hide_dependabot: bool,
+        max_age_days: u64,
+    ) -> Result<Vec<ReviewRequestPr>> {
         #[derive(Deserialize)]
         struct GqlData {
             search: GqlSearch,
@@ -351,18 +380,6 @@ impl GitHubClient {
             state: String,
         }
 
-        let reviewer = if direct_only {
-            "@me".to_string()
-        } else {
-            self.username.clone()
-        };
-
-        // `is:unmerged` filters out merged PRs; combined with `is:open` we get
-        // only PRs that are still open and awaiting review.
-        let search_query_base = format!(
-            "is:pr is:open is:unmerged review-requested:{reviewer}"
-        );
-
         let graphql_query = r#"
             query($q: String!, $after: String) {
               search(query: $q, type: ISSUE, first: 50, after: $after) {
@@ -415,7 +432,7 @@ impl GitHubClient {
                 .graphql(&body)
                 .await
                 .with_context(|| {
-                    format!("GraphQL review-requested search for {}", self.username)
+                    format!("GraphQL PR search for {}", self.username)
                 })?;
 
             let search = resp.search;

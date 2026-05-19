@@ -1,0 +1,111 @@
+<h2>Review Requests List — Layout Options</h2>
+<p class="subtitle">How should the list show status, CI checks, and dates to help you prioritize what to review?</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup-body" style="font-family:monospace;font-size:12px;background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;line-height:1.7">
+        <div style="color:#888;margin-bottom:6px;font-size:11px">▼ NEEDS YOUR REVIEW (3)</div>
+        <div style="border-left:3px solid #f0a500;padding-left:8px;margin-bottom:4px">
+          <span style="color:#4caf50">✓CI</span> <span style="color:#aaa">alice/backend</span> <span style="color:#fff">#42 Add rate limiting</span>
+          <span style="color:#ffc107;font-size:10px;margin-left:6px">⏳ REVIEW_REQ</span>
+          <span style="color:#666;font-size:10px;margin-left:6px">2h ago</span>
+        </div>
+        <div style="border-left:3px solid #f0a500;padding-left:8px;margin-bottom:4px">
+          <span style="color:#f44336">✗CI</span> <span style="color:#aaa">alice/frontend</span> <span style="color:#fff">#17 Dark mode toggle</span>
+          <span style="color:#ffc107;font-size:10px;margin-left:6px">⏳ REVIEW_REQ</span>
+          <span style="color:#666;font-size:10px;margin-left:6px">5h ago</span>
+        </div>
+        <div style="border-left:3px solid #f0a500;padding-left:8px;margin-bottom:10px">
+          <span style="color:#9e9e9e">◌CI</span> <span style="color:#aaa">bob/api</span> <span style="color:#fff">#8 Refactor auth</span>
+          <span style="color:#ffc107;font-size:10px;margin-left:6px">⏳ REVIEW_REQ</span>
+          <span style="color:#666;font-size:10px;margin-left:6px">1d ago</span>
+          <span style="color:#90caf9;font-size:10px;margin-left:4px">[DRAFT]</span>
+        </div>
+        <div style="color:#888;margin-bottom:6px;font-size:11px">▼ WAITING FOR AUTHOR (2)</div>
+        <div style="opacity:0.55;border-left:3px solid #555;padding-left:8px;margin-bottom:4px">
+          <span style="color:#4caf50">✓CI</span> <span style="color:#aaa">alice/backend</span> <span style="color:#ccc">#39 Fix null pointer</span>
+          <span style="color:#4caf50;font-size:10px;margin-left:6px">✓ APPROVED</span>
+          <span style="color:#666;font-size:10px;margin-left:6px">reviewed 3d ago</span>
+        </div>
+        <div style="opacity:0.55;border-left:3px solid #555;padding-left:8px;margin-bottom:4px">
+          <span style="color:#4caf50">✓CI</span> <span style="color:#aaa">bob/api</span> <span style="color:#ccc">#5 Update deps</span>
+          <span style="color:#f44336;font-size:10px;margin-left:6px">↩ CHANGES_REQ</span>
+          <span style="color:#666;font-size:10px;margin-left:6px">reviewed 1d ago</span>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A — Grouped Sections</h3>
+      <p>Two groups: "Needs Your Review" (action items, highlighted) and "Waiting for Author" (already reviewed, dimmed). CI badge, review decision, and time shown inline. Reviewed items are visually deprioritized.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup-body" style="font-family:monospace;font-size:12px;background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;line-height:1.7">
+        <div style="display:flex;gap:10px;margin-bottom:8px;font-size:11px">
+          <span style="color:#f0a500;border-bottom:2px solid #f0a500;padding-bottom:2px">[Needs Review (3)]</span>
+          <span style="color:#888">[ Waiting (2) ]</span>
+        </div>
+        <div style="margin-bottom:6px">
+          <div><span style="color:#f44336">✗CI</span> <span style="color:#aaa">alice/frontend</span> <span style="color:#fff">#17 Dark mode toggle</span> <span style="color:#666;font-size:10px;float:right">5h ago</span></div>
+          <div style="font-size:10px;color:#888;padding-left:16px">by carol · REVIEW_REQUIRED · CI FAILING</div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div><span style="color:#4caf50">✓CI</span> <span style="color:#aaa">alice/backend</span> <span style="color:#fff">#42 Add rate limiting</span> <span style="color:#666;font-size:10px;float:right">2h ago</span></div>
+          <div style="font-size:10px;color:#888;padding-left:16px">by carol · REVIEW_REQUIRED · CI PASSING</div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div><span style="color:#9e9e9e">◌CI</span> <span style="color:#aaa">bob/api</span> <span style="color:#fff">#8 Refactor auth</span> <span style="color:#555;font-size:10px">[draft]</span> <span style="color:#666;font-size:10px;float:right">1d ago</span></div>
+          <div style="font-size:10px;color:#888;padding-left:16px">by dave · REVIEW_REQUIRED · CI PENDING</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B — Tabbed View</h3>
+      <p>Two keyboard-navigable tabs: "Needs Review" and "Waiting". Two-line compact format per row: title+time, then CI/status/author on a secondary line. Tab-switchable, sorted by urgency (CI failing first).</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup-body" style="font-family:monospace;font-size:12px;background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;line-height:1.7">
+        <div style="display:flex;gap:8px;color:#666;font-size:10px;margin-bottom:4px">
+          <span style="flex:2.5">REPO / TITLE</span>
+          <span style="flex:0.7;text-align:center">CI</span>
+          <span style="flex:1.3;text-align:center">REVIEW STATUS</span>
+          <span style="flex:0.8;text-align:right">UPDATED</span>
+        </div>
+        <div style="display:flex;gap:8px;padding:3px 0">
+          <span style="flex:2.5"><span style="color:#aaa">alice/backend</span> <span style="color:#fff">#42</span> Add rate limiting</span>
+          <span style="flex:0.7;text-align:center;color:#4caf50">✓ PASS</span>
+          <span style="flex:1.3;text-align:center;color:#ffc107">REVIEW_REQ</span>
+          <span style="flex:0.8;text-align:right;color:#666">2h</span>
+        </div>
+        <div style="display:flex;gap:8px;padding:3px 0;background:#f4433610;border-radius:2px">
+          <span style="flex:2.5"><span style="color:#aaa">alice/frontend</span> <span style="color:#fff">#17</span> Dark mode toggle</span>
+          <span style="flex:0.7;text-align:center;color:#f44336">✗ FAIL</span>
+          <span style="flex:1.3;text-align:center;color:#ffc107">REVIEW_REQ</span>
+          <span style="flex:0.8;text-align:right;color:#666">5h</span>
+        </div>
+        <div style="display:flex;gap:8px;padding:3px 0;opacity:0.45">
+          <span style="flex:2.5"><span style="color:#aaa">bob/api</span> <span style="color:#ccc">#39</span> Fix null ptr</span>
+          <span style="flex:0.7;text-align:center;color:#4caf50">✓ PASS</span>
+          <span style="flex:1.3;text-align:center;color:#4caf50">APPROVED</span>
+          <span style="flex:0.8;text-align:right;color:#666">3d</span>
+        </div>
+        <div style="display:flex;gap:8px;padding:3px 0;opacity:0.45">
+          <span style="flex:2.5"><span style="color:#aaa">bob/api</span> <span style="color:#ccc">#5</span> Update deps</span>
+          <span style="flex:0.7;text-align:center;color:#4caf50">✓ PASS</span>
+          <span style="flex:1.3;text-align:center;color:#f44336">CHANGES_REQ</span>
+          <span style="flex:0.8;text-align:right;color:#666">1d</span>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C — Single Sorted List</h3>
+      <p>One unified list sorted by priority: unreviewed PRs at top, reviewed/waiting items dimmed at bottom. Columnar: repo/title | CI | review status | age. No toggling — scroll position signals priority.</p>
+    </div>
+  </div>
+</div>

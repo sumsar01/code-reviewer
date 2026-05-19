@@ -47,16 +47,20 @@ enum DisplayItem<'a> {
     },
     PrRow {
         pr: &'a ReviewRequestPr,
+        /// 0 = requested list, 1 = reviewed list
+        list_id: u8,
         pr_index: usize,
         dimmed: bool,
     },
 }
 
 /// Build a flat display list with section headers inserted.
-/// `rr_cursor` is an index into `prs`; the returned vec contains headers
-/// and rows so the caller can map pr_index → display position.
-fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
-    let needs: Vec<(usize, &ReviewRequestPr)> = prs
+/// `requested` are PRs needing review; `reviewed` are PRs already reviewed.
+fn build_display_items<'a>(
+    requested: &'a [ReviewRequestPr],
+    reviewed: &'a [ReviewRequestPr],
+) -> Vec<DisplayItem<'a>> {
+    let needs: Vec<(usize, &ReviewRequestPr)> = requested
         .iter()
         .enumerate()
         .filter(|(_, pr)| {
@@ -67,7 +71,7 @@ fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
         })
         .collect();
 
-    let waiting: Vec<(usize, &ReviewRequestPr)> = prs
+    let waiting: Vec<(usize, &ReviewRequestPr)> = requested
         .iter()
         .enumerate()
         .filter(|(_, pr)| {
@@ -88,6 +92,7 @@ fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
     for (idx, pr) in &needs {
         items.push(DisplayItem::PrRow {
             pr,
+            list_id: 0,
             pr_index: *idx,
             dimmed: false,
         });
@@ -102,7 +107,24 @@ fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
         for (idx, pr) in &waiting {
             items.push(DisplayItem::PrRow {
                 pr,
+                list_id: 0,
                 pr_index: *idx,
+                dimmed: true,
+            });
+        }
+    }
+
+    if !reviewed.is_empty() {
+        items.push(DisplayItem::SectionHeader {
+            label: "REVIEWED BY YOU",
+            count: reviewed.len(),
+            dimmed: true,
+        });
+        for (idx, pr) in reviewed.iter().enumerate() {
+            items.push(DisplayItem::PrRow {
+                pr,
+                list_id: 1,
+                pr_index: idx,
                 dimmed: true,
             });
         }
@@ -111,10 +133,10 @@ fn build_display_items(prs: &[ReviewRequestPr]) -> Vec<DisplayItem<'_>> {
     items
 }
 
-/// Find the display-list position for a given pr_index (skipping headers).
-fn display_index_for_pr(display_items: &[DisplayItem], pr_index: usize) -> Option<usize> {
+/// Find the display-list position for a given (list_id, pr_index) pair.
+fn display_index_for_pr(display_items: &[DisplayItem], list_id: u8, pr_index: usize) -> Option<usize> {
     display_items.iter().position(|item| {
-        matches!(item, DisplayItem::PrRow { pr_index: idx, .. } if *idx == pr_index)
+        matches!(item, DisplayItem::PrRow { list_id: lid, pr_index: idx, .. } if *lid == list_id && *idx == pr_index)
     })
 }
 
@@ -257,7 +279,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         + COL_UPDATED_WIDTH + COL_GAP
         + COL_AUTHOR_WIDTH;
 
-    let display = build_display_items(&app.rr_prs);
+    let display = build_display_items(&app.rr_prs, &app.rr_reviewed_prs);
 
     let items: Vec<ListItem> = display
         .iter()
@@ -279,7 +301,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     style,
                 )]))
             }
-            DisplayItem::PrRow { pr, dimmed, .. } => {
+            DisplayItem::PrRow { pr, dimmed, list_id: _, .. } => {
                 let repo = truncate(
                     &format!("{}/{}", pr.repo_owner, pr.repo_name),
                     COL_REPO_WIDTH,
@@ -423,7 +445,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
     let mut list_state = ListState::default();
     // Map rr_cursor (pr index) → display position (which skips section headers)
-    let display_pos = display_index_for_pr(&display, app.rr_cursor).unwrap_or(1);
+    let display_pos = display_index_for_pr(&display, 0, app.rr_cursor).unwrap_or(1);
     list_state.select(Some(display_pos));
 
     f.render_stateful_widget(list, area, &mut list_state);

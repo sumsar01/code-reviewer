@@ -332,7 +332,10 @@ pub(crate) enum BgMsg {
     /// A new GitHubClient authenticated for a different owner is ready.
     GithubClientReady(Arc<GitHubClient>),
     /// Cross-repo review-requested PRs loaded.
-    ReviewRequestPrsLoaded(Vec<ReviewRequestPr>),
+    ReviewRequestPrsLoaded {
+        requested: Vec<ReviewRequestPr>,
+        reviewed: Vec<ReviewRequestPr>,
+    },
     /// Failed to load review-requested PRs.
     ReviewRequestPrsError(String),
     /// A single PR fetched by owner/repo/number (used when jumping from review-requests screen).
@@ -415,6 +418,8 @@ pub struct App {
     // ── Review Requests screen state ──────────────────────────────────────────
     /// PRs across all repos where the current user has been requested as reviewer.
     pub rr_prs: Vec<ReviewRequestPr>,
+    /// PRs the user has already reviewed (open, no longer in review-requested queue).
+    pub rr_reviewed_prs: Vec<ReviewRequestPr>,
     /// Cursor position in the review-requests list.
     pub rr_cursor: usize,
     /// Load state for the review-requests list.
@@ -512,6 +517,7 @@ impl App {
             repo_switcher: None,
             user_orgs: Vec::new(),
             rr_prs: Vec::new(),
+            rr_reviewed_prs: Vec::new(),
             rr_cursor: 0,
             rr_load_state: LoadState::Idle,
             rr_show_all: false,
@@ -801,8 +807,9 @@ impl App {
                 // Re-fetch orgs for the new account so search stays biased correctly.
                 self.fetch_user_orgs();
             }
-            BgMsg::ReviewRequestPrsLoaded(prs) => {
-                self.rr_prs = prs;
+            BgMsg::ReviewRequestPrsLoaded { requested, reviewed } => {
+                self.rr_prs = requested;
+                self.rr_reviewed_prs = reviewed;
                 self.rr_cursor = 0;
                 self.rr_load_state = LoadState::Idle;
             }
@@ -983,7 +990,7 @@ impl App {
 
         tokio::spawn(async move {
             match gh.fetch_review_requested_prs(direct_only, hide_dependabot, max_age_days).await {
-                Ok(prs) => { let _ = tx.send(BgMsg::ReviewRequestPrsLoaded(prs)); }
+                Ok((requested, reviewed)) => { let _ = tx.send(BgMsg::ReviewRequestPrsLoaded { requested, reviewed }); }
                 Err(e) => { let _ = tx.send(BgMsg::ReviewRequestPrsError(format!("{:#}", e))); }
             }
         });
